@@ -1,0 +1,11 @@
+# Никогда не в git: ключи, конфиги клиентов, база панели, сертификаты, окружение.
+*.conf
+!images/**/*.conf.example
+*.db
+*.sqlite*
+*.pem
+*.key
+.env
+data/
+__pycache__/
+*.pyc

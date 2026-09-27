@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""awgctl — manage peers of AmneziaWG / WireGuard docker containers on this host.
+
+The panel calls it locally or over SSH (forced command, see --ssh). Output is JSON.
+
+  awgctl list
+  awgctl dump [CONTAINER ...]
+  awgctl params CONTAINER
+  awgctl next-ip CONTAINER
+  awgctl add CONTAINER --pub KEY --ip 10.8.3.5 [--name NAME]   # preshared key on stdin (may be empty)
+  awgctl remove|disable|enable CONTAINER --pub KEY
+  awgctl set-name CONTAINER --pub KEY --name NAME
+
+Supported containers:
+  awg3               /etc/awg/awg0.conf, names in /etc/awg/names.json
+  amnezia-awg2       /opt/amnezia/awg/awg0.conf + clientsTable (Amnezia app)
+  amnezia-awg        /opt/amnezia/awg/wg0.conf  + clientsTable (Legacy)
+  amnezia-wireguard  /opt/amnezia/wireguard/wg0.conf + clientsTable
+
+Secrets never leave the host: private and preshared keys are not printed. Disabled peers are
+moved to "<conf>.disabled", which the containers' start scripts never load.
+"""
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+BACKUP_DIR = os.environ.get("AWGCTL_BACKUP_DIR", "/var/backups/awgctl")
+BACKUP_KEEP = 20
+LOCK = os.environ.get("AWGCTL_LOCK", "/run/awgctl.lock")
+KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+NAME_RE = re.compile(r"^[^\x00-\x1f\"\\]{1,64}$")
+
+KINDS = {
+    # name: (kind, conf, iface, tool, clients_table)
+    "awg3": ("awg3", "/etc/awg/awg0.conf", "awg0", "awg", None),
+    "amnezia-awg2": ("awg2", "/opt/amnezia/awg/awg0.conf", "awg0", "awg", "/opt/amnezia/awg/clientsTable"),
+    "amnezia-awg": ("legacy", "/opt/amnezia/awg/wg0.conf", "wg0", "wg", "/opt/amnezia/awg/clientsTable"),
+    "amnezia-wireguard": ("wireguard", "/opt/amnezia/wireguard/wg0.conf", "wg0", "wg",
+                          "/opt/amnezia/wireguard/clientsTable"),
+}
+AWG3_NAMES = "/etc/awg/names.json"
+AWG3_CLIENT = "/etc/awg/client.json"
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------- docker helpers ----------
+
+def sh(args, stdin=None, check=True):
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=30)
+    if check and p.returncode != 0:
+        raise Fail(f"{' '.join(args[:4])}...: {p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def dexec(container, cmd, stdin=None, check=True):
+    args = ["docker", "exec"] + (["-i"] if stdin is not None else []) + [container, "sh", "-c", cmd]
+    return sh(args, stdin=stdin, check=check)
+
+
+def read_file(container, path, missing_ok=True):
+    p = dexec(container, f"cat {shlex.quote(path)} 2>/dev/null", check=False)
+    if p.returncode != 0:
+        if missing_ok:
+            return None
+        raise Fail(f"{container}: cannot read {path}")
+    return p.stdout
+
+
+def write_file(container, path, content):
+    """Atomic write inside the container, previous version backed up on the host."""
+    old = read_file(container, path)
+    if old is not None:
+        d = os.path.join(BACKUP_DIR, container)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        with open(os.path.join(d, f"{stamp}-{os.path.basename(path)}"), "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(old)
+        files = sorted(os.listdir(d))
+        base = os.path.basename(path)
+        mine = [x for x in files if x.endswith("-" + base)]
+        for x in mine[:-BACKUP_KEEP]:
+            os.remove(os.path.join(d, x))
+    q = shlex.quote(path)
+    dexec(container, f"umask 077; cat > {q}.tmp && mv {q}.tmp {q}", stdin=content)
+
+
+def running_containers():
+    out = sh(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
+    return [n for n in out if n in KINDS]
+
+
+def spec(container):
+    if container not in KINDS:
+        raise Fail(f"unsupported container: {container}")
+    kind, conf, iface, tool, table = KINDS[container]
+    return {"name": container, "kind": kind, "conf": conf, "iface": iface, "tool": tool, "table": table}
+
+
+# ---------- config parsing ----------
+
+def parse_conf(text):
+    """-> (interface_lines, [peer_lines, ...]); each peer keeps its own lines verbatim."""
+    iface, peers, cur = [], [], None
+    for line in (text or "").splitlines():
+        if line.strip().lower() == "[peer]":
+            cur = [line]
+            peers.append(cur)
+        elif cur is None:
+            iface.append(line)
+        else:
+            cur.append(line)
+    return iface, peers
+
+
+def peer_field(peer, key):
+    for line in peer:
+        k, _, v = line.partition("=")
+        if k.strip().lower() == key.lower():
+            return v.strip()
+    return None
+
+
+def iface_field(iface, key, commented=False):
+    for line in iface:
+        s = line.strip()
+        if commented and s.startswith("#"):
+            s = s.lstrip("#").strip()
+        k, _, v = s.partition("=")
+        if k.strip() == key:
+            return v.strip()
+    return None
+
+
+def render(iface, peers):
+    blocks = ["\n".join(iface).rstrip()]
+    for p in peers:
+        blocks.append("\n".join(x for x in p).strip())
+    return "\n\n".join(blocks) + "\n"
+
+
+def load(s):
+    text = read_file(s["name"], s["conf"], missing_ok=False)
+    dis = read_file(s["name"], s["conf"] + ".disabled") or ""
+    iface, peers = parse_conf(text)
+    _, dpeers = parse_conf(dis)
+    s["_disabled_before"] = len(dpeers)
+    return iface, peers, dpeers
+
+
+def save(s, iface, peers, dpeers):
+    write_file(s["name"], s["conf"], render(iface, peers))
+    if dpeers or s.get("_disabled_before"):
+        body = "\n\n".join("\n".join(p).strip() for p in dpeers)
+        write_file(s["name"], s["conf"] + ".disabled", body + "\n" if body else "")
+
+
+# ---------- names ----------
+
+def load_names(s):
+    if s["kind"] == "awg3":
+        raw = read_file(s["name"], AWG3_NAMES)
+        return json.loads(raw) if raw and raw.strip() else {}
+    raw = read_file(s["name"], s["table"])
+    try:
+        table = json.loads(raw) if raw and raw.strip() else []
+    except json.JSONDecodeError:
+        table = []
+    return {c.get("clientId"): (c.get("userData") or {}).get("clientName", "") for c in table}
+
+
+def update_names(s, pub, name=None, ip=None, remove=False):
+    if s["kind"] == "awg3":
+        names = load_names(s)
+        if remove:
+            names.pop(pub, None)
+        else:
+            names[pub] = name or names.get(pub, "")
+        write_file(s["name"], AWG3_NAMES, json.dumps(names, ensure_ascii=False, indent=2))
+        return
+    raw = read_file(s["name"], s["table"])
+    try:
+        table = json.loads(raw) if raw and raw.strip() else []
+    except json.JSONDecodeError:
+        raise Fail(f"{s['name']}: clientsTable is not valid JSON, refusing to overwrite it")
+    table = [c for c in table if c.get("clientId") != pub] if remove else table
+    if not remove:
+        for c in table:
+            if c.get("clientId") == pub:
+                c.setdefault("userData", {})["clientName"] = name or c["userData"].get("clientName", "")
+                break
+        else:
+            table.append({"clientId": pub, "userData": {
+                "clientName": name or "", "creationDate": time.strftime("%a %b %-d %H:%M:%S %Y"),
+                "allowedIps": ip or "", "allowed_ips": ip or ""}})
+    write_file(s["name"], s["table"], json.dumps(table, ensure_ascii=False, indent=4))
+
+
+# ---------- live interface ----------
+
+def iface_up(s):
+    return dexec(s["name"], f"ip link show {s['iface']} >/dev/null 2>&1", check=False).returncode == 0
+
+
+def live_dump(s):
+    p = dexec(s["name"], f"{s['tool']} show {s['iface']} dump", check=False)
+    if p.returncode != 0:
+        return None
+    rows = {}
+    lines = p.stdout.strip().splitlines()
+    for line in lines[1:]:
+        f = line.split("\t")
+        if len(f) < 8:
+            continue
+        rows[f[0]] = {"endpoint": None if f[2] == "(none)" else f[2], "allowed_ips": f[3],
+                      "latest_handshake": int(f[4]), "rx": int(f[5]), "tx": int(f[6])}
+    return rows
+
+
+def live_add(s, pub, ip, psk):
+    if not iface_up(s):
+        return
+    if psk:
+        dexec(s["name"], f"{s['tool']} set {s['iface']} peer {pub} preshared-key /dev/stdin allowed-ips {ip}",
+              stdin=psk + "\n")
+    else:
+        dexec(s["name"], f"{s['tool']} set {s['iface']} peer {pub} allowed-ips {ip}")
+
+
+def live_remove(s, pub):
+    if iface_up(s):
+        dexec(s["name"], f"{s['tool']} set {s['iface']} peer {pub} remove", check=False)
+
+
+# ---------- commands ----------
+
+def cmd_list(_a):
+    out = []
+    for c in running_containers():
+        s = spec(c)
+        iface, peers, dpeers = load(s)
+        out.append({"name": c, "kind": s["kind"], "iface": s["iface"],
+                    "port": int(iface_field(iface, "ListenPort") or 0), "up": iface_up(s),
+                    "peers": len(peers), "disabled": len(dpeers)})
+    return out
+
+
+def cmd_dump(a):
+    res = {}
+    for c in (a.containers or running_containers()):
+        s = spec(c)
+        iface, peers, dpeers = load(s)
+        live = live_dump(s)
+        names = load_names(s)
+        rows = []
+        for disabled, group in ((False, peers), (True, dpeers)):
+            for p in group:
+                pub = peer_field(p, "PublicKey")
+                if not pub:
+                    continue
+                row = {"pub": pub, "name": names.get(pub, ""), "ip": peer_field(p, "AllowedIPs"),
+                       "disabled": disabled, "endpoint": None, "latest_handshake": 0, "rx": 0, "tx": 0}
+                if live and pub in live and not disabled:
+                    row.update({k: live[pub][k] for k in ("endpoint", "latest_handshake", "rx", "tx")})
+                rows.append(row)
+        res[c] = {"kind": s["kind"], "up": live is not None,
+                  "port": int(iface_field(iface, "ListenPort") or 0), "peers": rows, "at": int(time.time())}
+    return res
+
+
+def cmd_params(a):
+    s = spec(a.container)
+    iface, _, _ = load(s)
+    if s["kind"] == "awg3":
+        c = json.loads(read_file(s["name"], AWG3_CLIENT, missing_ok=False))
+        return {"kind": "awg3", "server_public_key": c["server_public_key"], "port": c["port"],
+                "subnet": c["subnet"], "shared": c["shared"], "client_side": c["client_side"],
+                "header_protection_key": c["header_protection_key"],
+                "mtu": c.get("mtu", 1280), "dns": c.get("dns", "1.1.1.1, 1.0.0.1"),
+                "keepalive": c.get("keepalive", 25)}
+    keydir = os.path.dirname(s["conf"])
+    pub = (read_file(s["name"], f"{keydir}/wireguard_server_public_key.key") or "").strip()
+    shared, client_side = {}, {}
+    for k in ("S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"):
+        v = iface_field(iface, k)
+        if v is not None:
+            shared[k] = v
+    for k in ("Jc", "Jmin", "Jmax"):
+        v = iface_field(iface, k)
+        if v is not None:
+            client_side[k] = v
+    for k in ("I1", "I2", "I3", "I4", "I5"):
+        v = iface_field(iface, k, commented=True)
+        if v:
+            client_side[k] = v
+    return {"kind": s["kind"], "server_public_key": pub, "port": int(iface_field(iface, "ListenPort") or 0),
+            "subnet": iface_field(iface, "Address"), "shared": shared, "client_side": client_side,
+            "header_protection_key": None, "mtu": 1376 if s["kind"] != "wireguard" else 1420,
+            "dns": "1.1.1.1, 1.0.0.1", "keepalive": 25}
+
+
+def used_ips(peers):
+    ips = set()
+    for p in peers:
+        for part in (peer_field(p, "AllowedIPs") or "").split(","):
+            part = part.strip()
+            if part:
+                ips.add(str(ipaddress.ip_interface(part).ip))
+    return ips
+
+
+def cmd_next_ip(a):
+    s = spec(a.container)
+    iface, peers, dpeers = load(s)
+    addr = ipaddress.ip_interface((iface_field(iface, "Address") or "").split(",")[0].strip())
+    used = used_ips(peers + dpeers) | {str(addr.ip)}
+    for host in addr.network.hosts():
+        if str(host) not in used and not str(host).endswith(".0"):
+            return {"ip": f"{host}/32"}
+    raise Fail("subnet is full")
+
+
+def find(group, pub):
+    for i, p in enumerate(group):
+        if peer_field(p, "PublicKey") == pub:
+            return i
+    return None
+
+
+def check_key(pub):
+    if not KEY_RE.match(pub or ""):
+        raise Fail("bad public key")
+
+
+def cmd_add(a):
+    s = spec(a.container)
+    check_key(a.pub)
+    ip = str(ipaddress.ip_interface(a.ip))
+    if a.name and not NAME_RE.match(a.name):
+        raise Fail("bad name")
+    psk = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+    if psk and not KEY_RE.match(psk):
+        raise Fail("bad preshared key")
+    iface, peers, dpeers = load(s)
+    if find(peers, a.pub) is not None or find(dpeers, a.pub) is not None:
+        raise Fail("peer already exists")
+    if str(ipaddress.ip_interface(ip).ip) in used_ips(peers + dpeers):
+        raise Fail("ip already used")
+    block = ["[Peer]", f"PublicKey = {a.pub}"] + ([f"PresharedKey = {psk}"] if psk else []) + [f"AllowedIPs = {ip}"]
+    peers.append(block)
+    save(s, iface, peers, dpeers)
+    live_add(s, a.pub, ip, psk)
+    update_names(s, a.pub, a.name, ip)
+    return {"ok": True, "ip": ip}
+
+
+def cmd_remove(a):
+    s = spec(a.container)
+    check_key(a.pub)
+    iface, peers, dpeers = load(s)
+    i, j = find(peers, a.pub), find(dpeers, a.pub)
+    if i is None and j is None:
+        raise Fail("no such peer")
+    if i is not None:
+        peers.pop(i)
+    if j is not None:
+        dpeers.pop(j)
+    save(s, iface, peers, dpeers)
+    live_remove(s, a.pub)
+    update_names(s, a.pub, remove=True)
+    return {"ok": True}
+
+
+def cmd_disable(a):
+    s = spec(a.container)
+    check_key(a.pub)
+    iface, peers, dpeers = load(s)
+    i = find(peers, a.pub)
+    if i is None:
+        raise Fail("no such active peer")
+    dpeers.append(peers.pop(i))
+    save(s, iface, peers, dpeers)
+    live_remove(s, a.pub)
+    return {"ok": True}
+
+
+def cmd_enable(a):
+    s = spec(a.container)
+    check_key(a.pub)
+    iface, peers, dpeers = load(s)
+    j = find(dpeers, a.pub)
+    if j is None:
+        raise Fail("no such disabled peer")
+    p = dpeers.pop(j)
+    peers.append(p)
+    save(s, iface, peers, dpeers)
+    live_add(s, a.pub, peer_field(p, "AllowedIPs"), peer_field(p, "PresharedKey"))
+    return {"ok": True}
+
+
+def cmd_set_name(a):
+    s = spec(a.container)
+    check_key(a.pub)
+    if not NAME_RE.match(a.name or ""):
+        raise Fail("bad name")
+    update_names(s, a.pub, a.name)
+    return {"ok": True}
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="awgctl")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    d = sub.add_parser("dump")
+    d.add_argument("containers", nargs="*")
+    for name in ("params", "next-ip"):
+        sub.add_parser(name).add_argument("container")
+    ad = sub.add_parser("add")
+    ad.add_argument("container")
+    ad.add_argument("--pub", required=True)
+    ad.add_argument("--ip", required=True)
+    ad.add_argument("--name", default="")
+    for name in ("remove", "disable", "enable"):
+        x = sub.add_parser(name)
+        x.add_argument("container")
+        x.add_argument("--pub", required=True)
+    sn = sub.add_parser("set-name")
+    sn.add_argument("container")
+    sn.add_argument("--pub", required=True)
+    sn.add_argument("--name", required=True)
+    return ap
+
+
+HANDLERS = {"list": cmd_list, "dump": cmd_dump, "params": cmd_params, "next-ip": cmd_next_ip,
+            "add": cmd_add, "remove": cmd_remove, "disable": cmd_disable, "enable": cmd_enable,
+            "set-name": cmd_set_name}
+WRITES = {"add", "remove", "disable", "enable", "set-name"}
+
+
+def main(argv):
+    if argv[:1] == ["--ssh"]:
+        # Forced command in authorized_keys: only "awgctl <args>" is accepted, nothing else runs.
+        orig = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        if not orig or os.path.basename(orig[0]) != "awgctl":
+            print(json.dumps({"error": "only awgctl is allowed"}))
+            return 2
+        argv = orig[1:]
+    try:
+        a = build_parser().parse_args(argv)
+    except SystemExit:
+        print(json.dumps({"error": "bad arguments"}))
+        return 2
+    try:
+        with open(LOCK, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX if a.cmd in WRITES else fcntl.LOCK_SH)
+            print(json.dumps(HANDLERS[a.cmd](a), ensure_ascii=False))
+        return 0
+    except (Fail, ValueError, KeyError, json.JSONDecodeError) as e:
+        print(json.dumps({"error": str(e)}, ensure_ascii=False))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
