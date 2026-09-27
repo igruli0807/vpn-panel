@@ -1,0 +1,8 @@
+[Unit]
+Description=Check AmneziaWG interfaces inside amnezia-* containers
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/awg-guard.sh

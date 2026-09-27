@@ -1,0 +1,23 @@
+[Unit]
+Description=VPN panel (web UI for AmneziaWG clients)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=vpnpanel
+Group=vpnpanel
+Environment=PYTHONPATH=/opt/vpn-panel/panel:/opt/vpn-panel/panel/vendor
+Environment=VPN_PANEL_CONFIG=/etc/vpn-panel/config.json
+ExecStart=/usr/bin/python3 -m vpnpanel serve
+Restart=always
+RestartSec=5
+RuntimeDirectory=vpn-panel
+RuntimeDirectoryMode=0700
+# sudo awgctl needs privilege escalation, so NoNewPrivileges stays off; the rest is locked down.
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=150M
+
+[Install]
+WantedBy=multi-user.target
