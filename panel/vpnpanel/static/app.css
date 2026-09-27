@@ -75,5 +75,6 @@ code { font-size: 13px; }
 .steps { padding-left: 20px; } .steps li { margin-bottom: 4px; }
 @media (max-width: 640px) {
   .facts { grid-template-columns: 1fr; } .facts dt { margin-top: 6px; }
-  th:nth-child(4), td:nth-child(4) { display: none; }
+  th:nth-child(4), td:nth-child(4), th:nth-child(7), td:nth-child(7) { display: none; }
+  header { padding: 10px 16px; }
 }

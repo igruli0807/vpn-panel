@@ -1,6 +1,6 @@
 #!/bin/sh
 # awg-guard: раз в минуту проверяет, что в каждом VPN-контейнере Amnezia поднят интерфейс.
-# Контейнер может жить без интерфейса (после перезагрузки 20.09.2026 amnezia-awg2 на finvpn
+# Контейнер может жить без интерфейса (после перезагрузки 20.09.2026 amnezia-awg2 на одном из серверов
 # неделю так и стоял) — тогда поднимаем его тем же awg-quick/wg-quick, что и start.sh.
 for c in $(docker ps --format '{{.Names}}' | grep -E '^amnezia-(awg|wireguard)'); do
   docker exec "$c" sh -c '

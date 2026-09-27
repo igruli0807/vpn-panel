@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: gitleaks
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz | tar xz gitleaks
+          ./gitleaks detect --source . --redact --verbose --exit-code 1
+
+  panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: unit + HTTP tests (fake awgctl)
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+  awg3:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build -t awg3:3.1.20260828 images/awg3
+      - name: smoke — AWG 3.1 handshake with header protection
+        run: sudo tests/smoke-awg3.sh awg3:3.1.20260828
+      - name: awgctl against real containers
+        run: sudo tests/test-awgctl.sh awg3:3.1.20260828
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [secrets, panel, awg3]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push ghcr.io/${{ github.repository_owner }}/awg3
+        run: |
+          IMG=ghcr.io/${{ github.repository_owner }}/awg3
+          docker build -t $IMG:3.1.20260828 -t $IMG:latest images/awg3
+          docker push $IMG:3.1.20260828
+          docker push $IMG:latest

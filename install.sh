@@ -51,9 +51,14 @@ import json, sys
 path, expr = sys.argv[1], sys.argv[2]
 d = json.load(open(path))
 exec(expr)
+import os
+st = os.stat(path)
 tmp = path + ".tmp"
-json.dump(d, open(tmp, "w"), ensure_ascii=False, indent=2)
-import os; os.replace(tmp, path)
+with open(tmp, "w") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+os.chown(tmp, st.st_uid, st.st_gid)
+os.chmod(tmp, st.st_mode & 0o777)
+os.replace(tmp, path)
 PY
 }
 

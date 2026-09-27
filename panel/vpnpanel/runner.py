@@ -14,11 +14,15 @@ def command(cfg, server, args):
         base = (["sudo", "-n"] if cfg["use_sudo"] else []) + [cfg["awgctl"]]
         return base + list(args)
     run_dir = cfg["run_dir"]
+    # Connection sharing needs the runtime dir that systemd creates for the service; one-off CLI
+    # runs (poll-once, doctor.sh) go without it.
+    mux = (["-o", "ControlMaster=auto", "-o", f"ControlPath={run_dir}/ssh-%C", "-o", "ControlPersist=300"]
+           if os.path.isdir(run_dir) and os.access(run_dir, os.W_OK) else ["-o", "ControlMaster=no"])
     return ["ssh", "-i", server["ssh_key"], "-p", str(server.get("ssh_port", 22)),
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"UserKnownHostsFile={os.path.join(os.path.dirname(cfg['db']), 'known_hosts')}",
-            "-o", "ControlMaster=auto", "-o", f"ControlPath={run_dir}/ssh-%C", "-o", "ControlPersist=300",
+            *mux, "-o", "LogLevel=ERROR",
             f"{server.get('ssh_user', 'root')}@{server['ssh_host']}",
             "awgctl " + " ".join(shlex.quote(str(a)) for a in args)]
 

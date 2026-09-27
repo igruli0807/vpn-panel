@@ -90,7 +90,7 @@ def dashboard(sess, fmt, servers, health, server_health, clients, filters, now):
         state = "ok" if h["up"] else "bad"
         cards.append(f"""<a class="stat {state}" href="/?server={e(h['server'])}&amp;container={e(h['container'])}">
 <b>{e(titles.get(h['server'], h['server']))}</b><span>{e(KIND_TITLE.get(h['kind'], h['kind']))} · UDP {e(h['port'])}</span>
-<span class="big">{h['online']}<small> / {h['peers']} в сети</small></span></a>""")
+<span class="big">{h['online']}<small> в сети из {h['peers']}</small></span></a>""")
     sopt = '<option value="">все серверы</option>' + "".join(
         f'<option value="{e(s["id"])}" {"selected" if filters["server"] == s["id"] else ""}>{e(s.get("title", s["id"]))}</option>'
         for s in servers)
