@@ -15,12 +15,13 @@ if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^
   command -v awgctl >/dev/null && ok "awgctl установлен" || bad "awgctl не установлен (./install.sh server --proto awg3)"
   systemctl is-active -q awg-guard.timer && ok "сторож awg-guard работает" || warn "сторож awg-guard не включён"
   if command -v awgctl >/dev/null; then
-    awgctl list | python3 -c '
+    awgctl list | python3 /dev/fd/3 3<<'PY' || bad "awgctl list не отработал"
 import json, sys
 for c in json.load(sys.stdin):
     mark = "✅" if c["up"] else "❌"
-    print(f"  {mark} {c[\"name\"]}: {c[\"kind\"]}, UDP {c[\"port\"]}, клиентов {c[\"peers\"]}, отключено {c[\"disabled\"]}" + ("" if c["up"] else " — ИНТЕРФЕЙС НЕ ПОДНЯТ"))
-' || bad "awgctl list не отработал"
+    tail = "" if c["up"] else " — ИНТЕРФЕЙС НЕ ПОДНЯТ"
+    print("  %s %s: %s, UDP %s, клиентов %s, отключено %s%s" % (mark, c["name"], c["kind"], c["port"], c["peers"], c["disabled"], tail))
+PY
   fi
 fi
 
@@ -33,14 +34,17 @@ if [ -f /etc/vpn-panel/config.json ]; then
   [ -n "$end" ] && ok "сертификат до $end" || bad "нет сертификата /etc/vpn-panel/tls.crt"
   [ "$(stat -c %a /var/lib/vpn-panel/panel.db 2>/dev/null)" = 600 ] && ok "база панели: права 600" || warn "база панели не создана или права не 600"
   sudo -u vpnpanel env PYTHONPATH=/opt/vpn-panel/panel:/opt/vpn-panel/panel/vendor VPN_PANEL_CONFIG=/etc/vpn-panel/config.json \
-    python3 -m vpnpanel poll-once 2>/dev/null | python3 -c '
+    python3 -m vpnpanel poll-once 2>/dev/null | python3 /dev/fd/3 3<<'PY' || bad "опрос серверов не отработал"
 import json, sys
 for sid, v in json.load(sys.stdin).items():
     if not v["ok"]:
-        print(f"  ❌ сервер {sid}: не отвечает"); continue
+        print("  ❌ сервер %s: не отвечает" % sid)
+        continue
     down = [c["container"] for c in v["containers"] if not c["up"]]
-    print(f"  {\"✅\" if not down else \"⚠️ \"} сервер {sid}: контейнеров {len(v[\"containers\"])}" + (f", без интерфейса: {\", \".join(down)}" if down else ""))
-' || bad "опрос серверов не отработал"
+    mark = "✅" if not down else "⚠️ "
+    extra = (", без интерфейса: " + ", ".join(down)) if down else ""
+    print("  %s сервер %s: контейнеров %d%s" % (mark, sid, len(v["containers"]), extra))
+PY
   rss=$(ps -o rss= -C python3 --sort=-rss 2>/dev/null | head -1); [ -n "$rss" ] && ok "память процесса панели: $((rss/1024)) МБ"
 fi
 exit $FAIL
