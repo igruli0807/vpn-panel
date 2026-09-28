@@ -29,7 +29,7 @@ tar -C "$TMP" -czf - panel.db config.json ssh | \
 chmod 600 "$OUT/$NAME"
 ls -1t $OUT/panel-*.tgz.enc | tail -n +$((KEEP + 1)) | xargs -r rm -f
 if [ -n "$BACKUP_HOST" ]; then
-  ssh -i $ETC/ssh/backup_ed25519 -p "$BACKUP_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+  ssh -i $ETC/ssh/backup_ed25519 -o IdentitiesOnly=yes -p "$BACKUP_PORT" -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
       -o UserKnownHostsFile=$ETC/ssh/backup_known_hosts root@"$BACKUP_HOST" "vpn-backup-recv $NAME" < "$OUT/$NAME"
   echo "backup $NAME: local + $BACKUP_HOST ($(stat -c %s "$OUT/$NAME") bytes)"
 else

@@ -19,7 +19,7 @@ def command(cfg, server, args):
     mux = (["-o", "ControlMaster=auto", "-o", f"ControlPath={run_dir}/ssh-%C", "-o", "ControlPersist=300"]
            if os.path.isdir(run_dir) and os.access(run_dir, os.W_OK) else ["-o", "ControlMaster=no"])
     return ["ssh", "-i", server["ssh_key"], "-p", str(server.get("ssh_port", 22)),
-            "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes",
             "-o", "StrictHostKeyChecking=accept-new",
             "-o", f"UserKnownHostsFile={os.path.join(os.path.dirname(cfg['db']), 'known_hosts')}",
             *mux, "-o", "LogLevel=ERROR",
