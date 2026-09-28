@@ -30,6 +30,8 @@
 
 ## Установка
 
+**Пошагово, с нуля до выданного VPN: [docs/QUICKSTART.md](docs/QUICKSTART.md).**
+
 Нужны Debian 12 / Ubuntu 22.04+, root, `python3` ≥ 3.9. Для VPN-сервера — Docker (поставится сам).
 
 ```bash
@@ -44,6 +46,12 @@ vpn-panel-passwd && systemctl start vpn-panel      # пароль владель
 
 # 3. Ещё один VPN-сервер в ту же панель (запускать на хосте панели)
 ./install.sh add-server --id usa --title "США" --host 203.0.113.10
+
+# Домен с настоящим сертификатом, почта, защита SSH, бэкап
+./install.sh domain --name vpn.example.com
+./install.sh mail --domain example.com
+./install.sh harden
+./install.sh backup --to 203.0.113.10
 
 # Что работает и чего не хватает
 ./doctor.sh
