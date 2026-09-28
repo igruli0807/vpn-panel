@@ -89,7 +89,7 @@ python3 -c "import json;t=json.load(open('$WORK/amn/clientsTable'));assert len(t
 docker exec amnezia-awg2 awg show awg0 peers | grep -q "$p2" && fail "remove live" || ok "awg2: remove from live"
 
 SSH_ORIGINAL_COMMAND="awgctl list" "$CTL" --ssh >/dev/null && ok "ssh mode: awgctl allowed" || fail sshmode
-out=$(SSH_ORIGINAL_COMMAND="bash -c id" "$CTL" --ssh || true); grep -q "only awgctl" <<<"$out" && ok "ssh mode: other commands refused" || fail "sshdeny: $out"
+out=$(SSH_ORIGINAL_COMMAND="bash -c id" "$CTL" --ssh || true); grep -q "only vpnctl" <<<"$out" && ok "ssh mode: other commands refused" || fail "sshdeny: $out"
 
 [ "$(ls "$AWGCTL_BACKUP_DIR"/awg3 | wc -l)" -gt 0 ] && ok "backups written" || fail backups
 echo "PASS: $pass checks"

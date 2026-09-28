@@ -1,0 +1,1387 @@
+#!/usr/bin/env python3
+"""vpnctl — manage VPN servers on this host for the panel: AmneziaWG, SSTP (accel-ppp), VLESS (Xray REALITY).
+
+The panel calls it locally (sudo) or over SSH (forced command, see --ssh). Output: JSON on the last line.
+
+  vpnctl list | dump [UNIT ...] | params UNIT | next-ip UNIT
+  vpnctl add UNIT --pub ID [--ip IP] [--name NAME]     # secret on stdin: AWG preshared key / SSTP password
+  vpnctl remove|disable|enable UNIT --pub ID
+  vpnctl set-name UNIT --pub ID --name NAME
+  vpnctl install awg3|sstp|vless [--port N] [--sni HOST] [--domain NAME]
+  vpnctl uninstall awg3|sstp|vless                     # container removed, data kept aside
+  vpnctl preflight | unlink | version
+
+Units and identities (ID):
+  awg3, amnezia-awg2, amnezia-awg, amnezia-wireguard   AmneziaWG public key
+  sstp (container), sstp-host (system accel-ppp)       login
+  xray                                                 VLESS uuid
+
+Secrets never leave the host: private/preshared keys and passwords are not printed.
+"""
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+VERSION = "2.0.0"
+_env = lambda k, d: os.environ.get("VPNCTL_" + k) or os.environ.get("AWGCTL_" + k) or d
+BACKUP_DIR = _env("BACKUP_DIR", "/var/backups/vpnctl")
+BACKUP_KEEP = 20
+LOCK = _env("LOCK", "/run/vpnctl.lock")
+SSTP_DIR = _env("SSTP_DIR", "/opt/sstp")
+XRAY_DIR = _env("XRAY_DIR", "/opt/xray")
+HOST_SSTP_CONF = _env("HOST_SSTP_CONF", "/etc/accel-ppp.conf")
+STATE_DIR = _env("STATE_DIR", "/etc/vpnctl")
+LIB_DIR = _env("LIB", "/usr/local/lib/vpnctl")
+KEY_RE = re.compile(r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$")
+NAME_RE = re.compile(r"^[^\x00-\x1f\"\\]{1,64}$")
+USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+SSTP_PASS_RE = re.compile(r"^[A-Za-z0-9._~!@#%^+=:,-]{8,64}$")
+LOCAL_IMAGES = {"awg3": "awg3:3.1.20260828", "sstp": "sstp:1.14.0", "vless": "xray:26.3.27"}
+REMOTE_IMAGES = {"awg3": "ghcr.io/igruli0807/awg3:3.1.20260828", "sstp": "ghcr.io/igruli0807/sstp:1.14.0",
+                 "vless": "ghcr.io/igruli0807/xray:26.3.27"}
+
+KINDS = {
+    # name: (kind, conf, iface, tool, clients_table)
+    "awg3": ("awg3", "/etc/awg/awg0.conf", "awg0", "awg", None),
+    "amnezia-awg2": ("awg2", "/opt/amnezia/awg/awg0.conf", "awg0", "awg", "/opt/amnezia/awg/clientsTable"),
+    "amnezia-awg": ("legacy", "/opt/amnezia/awg/wg0.conf", "wg0", "wg", "/opt/amnezia/awg/clientsTable"),
+    "amnezia-wireguard": ("wireguard", "/opt/amnezia/wireguard/wg0.conf", "wg0", "wg",
+                          "/opt/amnezia/wireguard/clientsTable"),
+}
+AWG3_NAMES = "/etc/awg/names.json"
+AWG3_CLIENT = "/etc/awg/client.json"
+
+
+class Fail(Exception):
+    pass
+
+
+# ---------- docker helpers ----------
+
+def sh(args, stdin=None, check=True, timeout=30):
+    p = subprocess.run(args, input=stdin, capture_output=True, text=True, timeout=timeout)
+    if check and p.returncode != 0:
+        raise Fail(f"{' '.join(args[:4])}...: {p.stderr.strip() or p.stdout.strip()}")
+    return p
+
+
+def dexec(container, cmd, stdin=None, check=True):
+    args = ["docker", "exec"] + (["-i"] if stdin is not None else []) + [container, "sh", "-c", cmd]
+    return sh(args, stdin=stdin, check=check)
+
+
+def read_file(container, path, missing_ok=True):
+    p = dexec(container, f"cat {shlex.quote(path)} 2>/dev/null", check=False)
+    if p.returncode != 0:
+        if missing_ok:
+            return None
+        raise Fail(f"{container}: cannot read {path}")
+    return p.stdout
+
+
+def write_file(container, path, content):
+    """Atomic write inside the container, previous version backed up on the host."""
+    old = read_file(container, path)
+    if old is not None:
+        d = os.path.join(BACKUP_DIR, container)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        with open(os.path.join(d, f"{stamp}-{os.path.basename(path)}"), "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(old)
+        files = sorted(os.listdir(d))
+        base = os.path.basename(path)
+        mine = [x for x in files if x.endswith("-" + base)]
+        for x in mine[:-BACKUP_KEEP]:
+            os.remove(os.path.join(d, x))
+    q = shlex.quote(path)
+    dexec(container, f"umask 077; cat > {q}.tmp && mv {q}.tmp {q}", stdin=content)
+
+
+def running_containers():
+    out = sh(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
+    return [n for n in out if n in KINDS]
+
+
+def spec(container):
+    if container not in KINDS:
+        raise Fail(f"unsupported container: {container}")
+    kind, conf, iface, tool, table = KINDS[container]
+    return {"name": container, "kind": kind, "conf": conf, "iface": iface, "tool": tool, "table": table}
+
+
+# ---------- config parsing ----------
+
+def parse_conf(text):
+    """-> (interface_lines, [peer_lines, ...]); each peer keeps its own lines verbatim."""
+    iface, peers, cur = [], [], None
+    for line in (text or "").splitlines():
+        if line.strip().lower() == "[peer]":
+            cur = [line]
+            peers.append(cur)
+        elif cur is None:
+            iface.append(line)
+        else:
+            cur.append(line)
+    return iface, peers
+
+
+def peer_field(peer, key):
+    for line in peer:
+        k, _, v = line.partition("=")
+        if k.strip().lower() == key.lower():
+            return v.strip()
+    return None
+
+
+def iface_field(iface, key, commented=False):
+    for line in iface:
+        s = line.strip()
+        if commented and s.startswith("#"):
+            s = s.lstrip("#").strip()
+        k, _, v = s.partition("=")
+        if k.strip() == key:
+            return v.strip()
+    return None
+
+
+def render(iface, peers):
+    blocks = ["\n".join(iface).rstrip()]
+    for p in peers:
+        blocks.append("\n".join(x for x in p).strip())
+    return "\n\n".join(blocks) + "\n"
+
+
+def load(s):
+    text = read_file(s["name"], s["conf"], missing_ok=False)
+    dis = read_file(s["name"], s["conf"] + ".disabled") or ""
+    iface, peers = parse_conf(text)
+    _, dpeers = parse_conf(dis)
+    s["_disabled_before"] = len(dpeers)
+    return iface, peers, dpeers
+
+
+def save(s, iface, peers, dpeers):
+    write_file(s["name"], s["conf"], render(iface, peers))
+    if dpeers or s.get("_disabled_before"):
+        body = "\n\n".join("\n".join(p).strip() for p in dpeers)
+        write_file(s["name"], s["conf"] + ".disabled", body + "\n" if body else "")
+
+
+# ---------- names ----------
+
+def load_names(s):
+    if s["kind"] == "awg3":
+        raw = read_file(s["name"], AWG3_NAMES)
+        return json.loads(raw) if raw and raw.strip() else {}
+    raw = read_file(s["name"], s["table"])
+    try:
+        table = json.loads(raw) if raw and raw.strip() else []
+    except json.JSONDecodeError:
+        table = []
+    return {c.get("clientId"): (c.get("userData") or {}).get("clientName", "") for c in table}
+
+
+def update_names(s, pub, name=None, ip=None, remove=False):
+    if s["kind"] == "awg3":
+        names = load_names(s)
+        if remove:
+            names.pop(pub, None)
+        else:
+            names[pub] = name or names.get(pub, "")
+        write_file(s["name"], AWG3_NAMES, json.dumps(names, ensure_ascii=False, indent=2))
+        return
+    raw = read_file(s["name"], s["table"])
+    try:
+        table = json.loads(raw) if raw and raw.strip() else []
+    except json.JSONDecodeError:
+        raise Fail(f"{s['name']}: clientsTable is not valid JSON, refusing to overwrite it")
+    table = [c for c in table if c.get("clientId") != pub] if remove else table
+    if not remove:
+        for c in table:
+            if c.get("clientId") == pub:
+                c.setdefault("userData", {})["clientName"] = name or c["userData"].get("clientName", "")
+                break
+        else:
+            table.append({"clientId": pub, "userData": {
+                "clientName": name or "", "creationDate": time.strftime("%a %b %-d %H:%M:%S %Y"),
+                "allowedIps": ip or "", "allowed_ips": ip or ""}})
+    write_file(s["name"], s["table"], json.dumps(table, ensure_ascii=False, indent=4))
+
+
+# ---------- live interface ----------
+
+def iface_up(s):
+    return dexec(s["name"], f"ip link show {s['iface']} >/dev/null 2>&1", check=False).returncode == 0
+
+
+def live_dump(s):
+    p = dexec(s["name"], f"{s['tool']} show {s['iface']} dump", check=False)
+    if p.returncode != 0:
+        return None
+    rows = {}
+    lines = p.stdout.strip().splitlines()
+    for line in lines[1:]:
+        f = line.split("\t")
+        if len(f) < 8:
+            continue
+        rows[f[0]] = {"endpoint": None if f[2] == "(none)" else f[2], "allowed_ips": f[3],
+                      "latest_handshake": int(f[4]), "rx": int(f[5]), "tx": int(f[6])}
+    return rows
+
+
+def live_add(s, pub, ip, psk):
+    if not iface_up(s):
+        return
+    if psk:
+        dexec(s["name"], f"{s['tool']} set {s['iface']} peer {pub} preshared-key /dev/stdin allowed-ips {ip}",
+              stdin=psk + "\n")
+    else:
+        dexec(s["name"], f"{s['tool']} set {s['iface']} peer {pub} allowed-ips {ip}")
+
+
+def live_remove(s, pub):
+    if iface_up(s):
+        dexec(s["name"], f"{s['tool']} set {s['iface']} peer {pub} remove", check=False)
+
+
+
+
+# =====================================================================================
+# AWG driver (containers of the Amnezia app and our awg3)
+# =====================================================================================
+
+def awg_info(c):
+    s = spec(c)
+    iface, peers, dpeers = load(s)
+    return {"name": c, "kind": s["kind"], "iface": s["iface"],
+            "port": int(iface_field(iface, "ListenPort") or 0), "up": iface_up(s),
+            "peers": len(peers), "disabled": len(dpeers)}
+
+
+def awg_dump(c):
+    s = spec(c)
+    iface, peers, dpeers = load(s)
+    live = live_dump(s)
+    names = load_names(s)
+    rows = []
+    for disabled, group in ((False, peers), (True, dpeers)):
+        for p in group:
+            pub = peer_field(p, "PublicKey")
+            if not pub:
+                continue
+            row = {"pub": pub, "name": names.get(pub, ""), "ip": peer_field(p, "AllowedIPs"),
+                   "disabled": disabled, "endpoint": None, "latest_handshake": 0, "rx": 0, "tx": 0}
+            if live and pub in live and not disabled:
+                row.update({k: live[pub][k] for k in ("endpoint", "latest_handshake", "rx", "tx")})
+            rows.append(row)
+    return {"kind": s["kind"], "up": live is not None,
+            "port": int(iface_field(iface, "ListenPort") or 0), "peers": rows, "at": int(time.time())}
+
+
+def awg_params(c):
+    s = spec(c)
+    iface, _, _ = load(s)
+    if s["kind"] == "awg3":
+        cj = json.loads(read_file(s["name"], AWG3_CLIENT, missing_ok=False))
+        return {"kind": "awg3", "server_public_key": cj["server_public_key"], "port": cj["port"],
+                "subnet": cj["subnet"], "shared": cj["shared"], "client_side": cj["client_side"],
+                "header_protection_key": cj["header_protection_key"],
+                "mtu": cj.get("mtu", 1280), "dns": cj.get("dns", "1.1.1.1, 1.0.0.1"),
+                "keepalive": cj.get("keepalive", 25)}
+    keydir = os.path.dirname(s["conf"])
+    pub = (read_file(s["name"], f"{keydir}/wireguard_server_public_key.key") or "").strip()
+    shared, client_side = {}, {}
+    for k in ("S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4"):
+        v = iface_field(iface, k)
+        if v is not None:
+            shared[k] = v
+    for k in ("Jc", "Jmin", "Jmax"):
+        v = iface_field(iface, k)
+        if v is not None:
+            client_side[k] = v
+    for k in ("I1", "I2", "I3", "I4", "I5"):
+        v = iface_field(iface, k, commented=True)
+        if v:
+            client_side[k] = v
+    return {"kind": s["kind"], "server_public_key": pub, "port": int(iface_field(iface, "ListenPort") or 0),
+            "subnet": iface_field(iface, "Address"), "shared": shared, "client_side": client_side,
+            "header_protection_key": None, "mtu": 1376 if s["kind"] != "wireguard" else 1420,
+            "dns": "1.1.1.1, 1.0.0.1", "keepalive": 25}
+
+
+def used_ips(peers):
+    ips = set()
+    for p in peers:
+        for part in (peer_field(p, "AllowedIPs") or "").split(","):
+            part = part.strip()
+            if part:
+                ips.add(str(ipaddress.ip_interface(part).ip))
+    return ips
+
+
+def awg_next_ip(c):
+    s = spec(c)
+    iface, peers, dpeers = load(s)
+    addr = ipaddress.ip_interface((iface_field(iface, "Address") or "").split(",")[0].strip())
+    used = used_ips(peers + dpeers) | {str(addr.ip)}
+    for host in addr.network.hosts():
+        if str(host) not in used and not str(host).endswith(".0"):
+            return {"ip": f"{host}/32"}
+    raise Fail("subnet is full")
+
+
+def find(group, pub):
+    for i, p in enumerate(group):
+        if peer_field(p, "PublicKey") == pub:
+            return i
+    return None
+
+
+def check_key(pub):
+    if not KEY_RE.match(pub or ""):
+        raise Fail("bad public key")
+
+
+def awg_add(c, pub, name, ip, secret):
+    s = spec(c)
+    check_key(pub)
+    if not ip:
+        raise Fail("--ip is required for AmneziaWG")
+    ip = str(ipaddress.ip_interface(ip))
+    if secret and not KEY_RE.match(secret):
+        raise Fail("bad preshared key")
+    iface, peers, dpeers = load(s)
+    if find(peers, pub) is not None or find(dpeers, pub) is not None:
+        raise Fail("peer already exists")
+    if str(ipaddress.ip_interface(ip).ip) in used_ips(peers + dpeers):
+        raise Fail("ip already used")
+    block = ["[Peer]", f"PublicKey = {pub}"] + ([f"PresharedKey = {secret}"] if secret else []) + [f"AllowedIPs = {ip}"]
+    peers.append(block)
+    save(s, iface, peers, dpeers)
+    live_add(s, pub, ip, secret)
+    update_names(s, pub, name, ip)
+    return {"ok": True, "ip": ip}
+
+
+def awg_remove(c, pub):
+    s = spec(c)
+    check_key(pub)
+    iface, peers, dpeers = load(s)
+    i, j = find(peers, pub), find(dpeers, pub)
+    if i is None and j is None:
+        raise Fail("no such peer")
+    if i is not None:
+        peers.pop(i)
+    if j is not None:
+        dpeers.pop(j)
+    save(s, iface, peers, dpeers)
+    live_remove(s, pub)
+    update_names(s, pub, remove=True)
+    return {"ok": True}
+
+
+def awg_disable(c, pub):
+    s = spec(c)
+    check_key(pub)
+    iface, peers, dpeers = load(s)
+    i = find(peers, pub)
+    if i is None:
+        raise Fail("no such active peer")
+    dpeers.append(peers.pop(i))
+    save(s, iface, peers, dpeers)
+    live_remove(s, pub)
+    return {"ok": True}
+
+
+def awg_enable(c, pub):
+    s = spec(c)
+    check_key(pub)
+    iface, peers, dpeers = load(s)
+    j = find(dpeers, pub)
+    if j is None:
+        raise Fail("no such disabled peer")
+    p = dpeers.pop(j)
+    peers.append(p)
+    save(s, iface, peers, dpeers)
+    live_add(s, pub, peer_field(p, "AllowedIPs"), peer_field(p, "PresharedKey"))
+    return {"ok": True}
+
+
+def awg_set_name(c, pub, name):
+    check_key(pub)
+    update_names(spec(c), pub, name)
+    return {"ok": True}
+
+
+# =====================================================================================
+# host files (sstp, xray keep their state in host directories mounted into containers)
+# =====================================================================================
+
+def host_read(path, default=None):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return default
+
+
+def host_write(unit, path, content, mode=0o600):
+    """Atomic write on the host, previous version backed up (last BACKUP_KEEP)."""
+    old = host_read(path)
+    if old is not None:
+        d = os.path.join(BACKUP_DIR, unit)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        base = os.path.basename(path)
+        with open(os.path.join(d, f"{time.strftime('%Y%m%d-%H%M%S')}-{base}"), "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(old)
+        mine = sorted(x for x in os.listdir(d) if x.endswith("-" + base))
+        for x in mine[:-BACKUP_KEEP]:
+            os.remove(os.path.join(d, x))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        os.fchmod(f.fileno(), mode)
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def load_json_file(path, default):
+    raw = host_read(path)
+    if not raw or not raw.strip():
+        return default
+    return json.loads(raw)
+
+
+def ini_get(text, section, key):
+    cur = None
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            cur = s[1:-1].strip()
+        elif cur == section and "=" in s and not s.startswith("#"):
+            k, _, v = s.partition("=")
+            if k.strip() == key:
+                return v.strip()
+    return None
+
+
+def docker_names():
+    try:
+        return sh(["docker", "ps", "--format", "{{.Names}}"]).stdout.split()
+    except (Fail, FileNotFoundError):
+        return []
+
+
+# =====================================================================================
+# SSTP driver: accel-ppp — "sstp" container (installed by vpnctl) or "sstp-host" (system service)
+# chap-secrets lines: "user * password *"; disabled users are kept as "#disabled user * password *"
+# =====================================================================================
+
+def host_sstp_active():
+    if not os.path.exists(HOST_SSTP_CONF):
+        return False
+    return subprocess.run(["systemctl", "is-active", "--quiet", "accel-ppp"]).returncode == 0
+
+
+def sstp_unit(name):
+    if name == "sstp":
+        conf = f"{SSTP_DIR}/accel-ppp.conf"
+        return {"name": name, "kind": "sstp", "host": False, "conf": conf, "chap": f"{SSTP_DIR}/chap-secrets",
+                "names": f"{SSTP_DIR}/names.json", "cert": f"{SSTP_DIR}/server.crt"}
+    if name == "sstp-host":
+        text = host_read(HOST_SSTP_CONF, "")
+        return {"name": name, "kind": "sstp", "host": True, "conf": HOST_SSTP_CONF,
+                "chap": ini_get(text, "chap-secrets", "chap-secrets") or "/etc/ppp/chap-secrets",
+                "names": f"{STATE_DIR}/sstp-host-names.json",
+                "cert": ini_get(text, "sstp", "ssl-pemfile") or ""}
+    raise Fail(f"unsupported unit: {name}")
+
+
+def accel(u, *args, check=False):
+    text = host_read(u["conf"], "")
+    port = (ini_get(text, "cli", "tcp") or "127.0.0.1:2001").rsplit(":", 1)[-1]
+    cmd = ["accel-cmd", "-p", port, *args]
+    if not u["host"]:
+        cmd = ["docker", "exec", u["name"], *cmd]
+    return sh(cmd, check=check)
+
+
+def sstp_entries(u):
+    """-> list of dicts {user, password, disabled, raw}; comments are kept as {raw} only."""
+    out = []
+    for line in (host_read(u["chap"], "") or "").splitlines():
+        s = line.strip()
+        disabled = s.startswith("#disabled ")
+        body = s[len("#disabled "):] if disabled else s
+        f = body.split()
+        if not s or (s.startswith("#") and not disabled) or len(f) < 3:
+            out.append({"raw": line})
+            continue
+        out.append({"user": f[0], "password": f[2], "disabled": disabled, "raw": line})
+    return out
+
+
+def sstp_save(u, entries):
+    lines = []
+    for e in entries:
+        if "user" not in e:
+            lines.append(e["raw"])
+        else:
+            line = f"{e['user']} * {e['password']} *"
+            lines.append(("#disabled " + line) if e["disabled"] else line)
+    host_write(u["name"], u["chap"], "\n".join(lines).rstrip("\n") + "\n")
+    accel(u, "reload")
+
+
+def sstp_sessions(u):
+    p = accel(u, "show", "sessions", "username,ip,rx-bytes-raw,tx-bytes-raw,calling-sid")
+    res = {}
+    if p.returncode != 0:
+        return None
+    for line in p.stdout.splitlines()[2:]:
+        f = [x.strip() for x in line.split("|")]
+        if len(f) >= 5 and f[0]:
+            res[f[0]] = {"ip": f[1], "rx": int(f[2] or 0), "tx": int(f[3] or 0), "sid": f[4]}
+    return res
+
+
+def sstp_up(u):
+    if u["host"]:
+        return host_sstp_active()
+    return accel(u, "show", "stat").returncode == 0
+
+
+def sstp_find(entries, user):
+    for i, e in enumerate(entries):
+        if e.get("user") == user:
+            return i
+    return None
+
+
+def sstp_names(u):
+    return load_json_file(u["names"], {})
+
+
+def sstp_set_names(u, names):
+    host_write(u["name"], u["names"], json.dumps(names, ensure_ascii=False, indent=2))
+
+
+def sstp_info(name):
+    u = sstp_unit(name)
+    ents = [e for e in sstp_entries(u) if "user" in e]
+    return {"name": name, "kind": "sstp", "iface": "ppp", "port": int(ini_get(host_read(u["conf"], ""), "sstp", "port") or 0),
+            "up": sstp_up(u), "peers": sum(1 for e in ents if not e["disabled"]),
+            "disabled": sum(1 for e in ents if e["disabled"])}
+
+
+def sstp_dump(name):
+    u = sstp_unit(name)
+    live = sstp_sessions(u)
+    names = sstp_names(u)
+    now = int(time.time())
+    rows = []
+    for e in sstp_entries(u):
+        if "user" not in e:
+            continue
+        sess = (live or {}).get(e["user"]) if not e["disabled"] else None
+        rows.append({"pub": e["user"], "name": names.get(e["user"], ""), "ip": sess["ip"] if sess else "",
+                     "disabled": e["disabled"], "endpoint": sess["sid"] if sess else None,
+                     "latest_handshake": now if sess else 0, "rx": sess["rx"] if sess else 0,
+                     "tx": sess["tx"] if sess else 0})
+    return {"kind": "sstp", "up": live is not None and sstp_up(u),
+            "port": int(ini_get(host_read(u["conf"], ""), "sstp", "port") or 0), "peers": rows, "at": now}
+
+
+def cert_self_signed(pem_path):
+    p = subprocess.run(["openssl", "x509", "-in", pem_path, "-noout", "-issuer", "-subject"],
+                       capture_output=True, text=True)
+    if p.returncode != 0:
+        return True
+    lines = [x.split("=", 1)[-1].strip() for x in p.stdout.splitlines()]
+    return len(lines) == 2 and lines[0] == lines[1]
+
+
+def sstp_params(name):
+    u = sstp_unit(name)
+    text = host_read(u["conf"], "")
+    cert_path = u["cert"] if u["host"] else f"{SSTP_DIR}/{os.path.basename(ini_get(text, 'sstp', 'ssl-pemfile') or 'server.crt')}"
+    pem = host_read(cert_path, "") or ""
+    return {"kind": "sstp", "port": int(ini_get(text, "sstp", "port") or 0), "cert_pem": pem,
+            "self_signed": cert_self_signed(cert_path) if pem else True}
+
+
+def check_user(user):
+    if not USER_RE.match(user or ""):
+        raise Fail("bad user name (2-32: a-z 0-9 . _ -)")
+
+
+def sstp_add(name, user, disp, secret):
+    u = sstp_unit(name)
+    check_user(user)
+    if not SSTP_PASS_RE.match(secret or ""):
+        raise Fail("bad password (8-64 chars, no spaces or quotes)")
+    ents = sstp_entries(u)
+    if sstp_find(ents, user) is not None:
+        raise Fail("user already exists")
+    ents.append({"user": user, "password": secret, "disabled": False})
+    sstp_save(u, ents)
+    names = sstp_names(u)
+    names[user] = disp or ""
+    sstp_set_names(u, names)
+    return {"ok": True, "ip": ""}
+
+
+def sstp_terminate(u, user):
+    accel(u, "terminate", "username", user, "hard")
+
+
+def sstp_remove(name, user):
+    u = sstp_unit(name)
+    check_user(user)
+    ents = sstp_entries(u)
+    i = sstp_find(ents, user)
+    if i is None:
+        raise Fail("no such user")
+    ents.pop(i)
+    sstp_save(u, ents)
+    sstp_terminate(u, user)
+    names = sstp_names(u)
+    names.pop(user, None)
+    sstp_set_names(u, names)
+    return {"ok": True}
+
+
+def sstp_toggle(name, user, disabled):
+    u = sstp_unit(name)
+    check_user(user)
+    ents = sstp_entries(u)
+    i = sstp_find(ents, user)
+    if i is None or ents[i]["disabled"] == disabled:
+        raise Fail("no such " + ("active" if disabled else "disabled") + " user")
+    ents[i]["disabled"] = disabled
+    sstp_save(u, ents)
+    if disabled:
+        sstp_terminate(u, user)
+    return {"ok": True}
+
+
+def sstp_set_name(name, user, disp):
+    u = sstp_unit(name)
+    check_user(user)
+    names = sstp_names(u)
+    names[user] = disp
+    sstp_set_names(u, names)
+    return {"ok": True}
+
+
+# =====================================================================================
+# VLESS driver: Xray REALITY in the "xray" container; users added/removed live through `xray api`,
+# and persisted in config.json (disabled users live in disabled.json).
+# =====================================================================================
+
+XRAY_API = "127.0.0.1:10085"
+XRAY_TAG = "vless-in"
+
+
+def xr_files():
+    return {"config": f"{XRAY_DIR}/config.json", "meta": f"{XRAY_DIR}/meta.json",
+            "names": f"{XRAY_DIR}/names.json", "disabled": f"{XRAY_DIR}/disabled.json"}
+
+
+def xr_load():
+    f = xr_files()
+    cfg = load_json_file(f["config"], None)
+    if cfg is None:
+        raise Fail("xray is not installed")
+    inbound = next(i for i in cfg["inbounds"] if i.get("tag") == XRAY_TAG)
+    return cfg, inbound, load_json_file(f["disabled"], []), load_json_file(f["meta"], {})
+
+
+def xr_save(cfg, disabled):
+    f = xr_files()
+    host_write("xray", f["config"], json.dumps(cfg, ensure_ascii=False, indent=2))
+    host_write("xray", f["disabled"], json.dumps(disabled, ensure_ascii=False, indent=2))
+
+
+def xr_api(sub, *args, stdin=None, check=False):
+    # -s must come right after the subcommand: Go stops parsing flags at the first positional (email) argument
+    cmd = ["docker", "exec"] + (["-i"] if stdin is not None else []) + ["xray", "xray", "api", sub, "-s", XRAY_API, *args]
+    return sh(cmd, stdin=stdin, check=check)
+
+
+def xr_up():
+    if "xray" not in docker_names():
+        return False
+    return xr_api("inboundusercount", f"-tag={XRAY_TAG}").returncode == 0
+
+
+def xr_live_add(inbound, client):
+    body = json.dumps({"inbounds": [{"tag": XRAY_TAG, "port": inbound["port"], "protocol": "vless",
+                                     "settings": {"clients": [client], "decryption": "none"}}]})
+    p = sh(["docker", "exec", "-i", "xray", "sh", "-c",
+            f"cat > /tmp/u.json && xray api adu -s {XRAY_API} /tmp/u.json; rm -f /tmp/u.json"], stdin=body, check=False)
+    if "Added 1" not in p.stdout:
+        raise Fail(f"xray did not accept the user: {(p.stdout + p.stderr).strip()[-200:]}")
+
+
+def xr_live_remove(uid):
+    xr_api("rmu", f"-tag={XRAY_TAG}", uid)
+
+
+def xr_stats():
+    p = xr_api("statsquery", "-pattern", "user>>>")
+    res = {}
+    if p.returncode != 0:
+        return res
+    try:
+        data = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return res
+    for st in data.get("stat", []):
+        parts = st.get("name", "").split(">>>")
+        if len(parts) == 4 and parts[2] == "traffic":
+            res.setdefault(parts[1], {"up": 0, "down": 0})["up" if parts[3] == "uplink" else "down"] = int(st.get("value") or 0)
+    return res
+
+
+def xr_online(uid):
+    """-> (last_seen_ts, ip) from statsonlineiplist; (0, None) when the user is offline."""
+    p = xr_api("statsonlineiplist", "-email", uid)
+    if p.returncode != 0:
+        return 0, None
+    try:
+        data = json.loads(p.stdout or "{}")
+    except json.JSONDecodeError:
+        return 0, None
+    best = (0, None)
+    ips = data.get("ips") if isinstance(data, dict) else None
+    for ip, ts in (ips or {}).items():
+        try:
+            ts = int(ts)
+        except (TypeError, ValueError):
+            continue
+        if ts > best[0]:
+            best = (ts, ip)
+    return best
+
+
+def check_uuid(uid):
+    if not UUID_RE.match(uid or ""):
+        raise Fail("bad uuid")
+
+
+def xr_info(name="xray"):
+    cfg, inbound, disabled, _ = xr_load()
+    return {"name": "xray", "kind": "vless", "iface": "tcp", "port": inbound["port"], "up": xr_up(),
+            "peers": len(inbound["settings"]["clients"]), "disabled": len(disabled)}
+
+
+def xr_dump(name="xray"):
+    cfg, inbound, disabled, _ = xr_load()
+    names = load_json_file(xr_files()["names"], {})
+    up = xr_up()
+    stats = xr_stats() if up else {}
+    rows = []
+    for dis, group in ((False, inbound["settings"]["clients"]), (True, disabled)):
+        for c in group:
+            uid = c["id"]
+            ts, ip = xr_online(c.get("email", uid)) if (up and not dis) else (0, None)
+            st = stats.get(c.get("email", uid), {})
+            rows.append({"pub": uid, "name": names.get(uid, ""), "ip": "", "disabled": dis,
+                         "endpoint": ip, "latest_handshake": ts, "rx": st.get("up", 0), "tx": st.get("down", 0)})
+    return {"kind": "vless", "up": up, "port": inbound["port"], "peers": rows, "at": int(time.time())}
+
+
+def xr_params(name="xray"):
+    _, inbound, _, meta = xr_load()
+    return {"kind": "vless", "port": inbound["port"], "public_key": meta.get("public_key"),
+            "short_id": meta.get("short_id"), "sni": meta.get("sni"), "flow": meta.get("flow", "xtls-rprx-vision"),
+            "fp": meta.get("fp", "chrome")}
+
+
+def xr_add(name, uid, disp):
+    check_uuid(uid)
+    cfg, inbound, disabled, meta = xr_load()
+    if any(c["id"] == uid for c in inbound["settings"]["clients"] + disabled):
+        raise Fail("user already exists")
+    client = {"id": uid, "email": uid, "flow": meta.get("flow", "xtls-rprx-vision")}
+    inbound["settings"]["clients"].append(client)
+    xr_save(cfg, disabled)
+    if xr_up():
+        xr_live_add(inbound, client)
+    names = load_json_file(xr_files()["names"], {})
+    names[uid] = disp or ""
+    host_write("xray", xr_files()["names"], json.dumps(names, ensure_ascii=False, indent=2))
+    return {"ok": True, "ip": ""}
+
+
+def xr_remove(name, uid):
+    check_uuid(uid)
+    cfg, inbound, disabled, _ = xr_load()
+    before = len(inbound["settings"]["clients"]) + len(disabled)
+    inbound["settings"]["clients"] = [c for c in inbound["settings"]["clients"] if c["id"] != uid]
+    disabled = [c for c in disabled if c["id"] != uid]
+    if len(inbound["settings"]["clients"]) + len(disabled) == before:
+        raise Fail("no such user")
+    xr_save(cfg, disabled)
+    xr_live_remove(uid)
+    names = load_json_file(xr_files()["names"], {})
+    names.pop(uid, None)
+    host_write("xray", xr_files()["names"], json.dumps(names, ensure_ascii=False, indent=2))
+    return {"ok": True}
+
+
+def xr_toggle(name, uid, disable):
+    check_uuid(uid)
+    cfg, inbound, disabled, _ = xr_load()
+    src, dst = (inbound["settings"]["clients"], disabled) if disable else (disabled, inbound["settings"]["clients"])
+    c = next((x for x in src if x["id"] == uid), None)
+    if c is None:
+        raise Fail("no such " + ("active" if disable else "disabled") + " user")
+    src.remove(c)
+    dst.append(c)
+    xr_save(cfg, disabled)
+    if disable:
+        xr_live_remove(uid)
+    elif xr_up():
+        xr_live_add(inbound, c)
+    return {"ok": True}
+
+
+def xr_set_name(name, uid, disp):
+    check_uuid(uid)
+    names = load_json_file(xr_files()["names"], {})
+    names[uid] = disp
+    host_write("xray", xr_files()["names"], json.dumps(names, ensure_ascii=False, indent=2))
+    return {"ok": True}
+
+
+# =====================================================================================
+# dispatch
+# =====================================================================================
+
+def unit_kind(name):
+    if name in KINDS:
+        return "awg"
+    if name in ("sstp", "sstp-host"):
+        return "sstp"
+    if name == "xray":
+        return "vless"
+    raise Fail(f"unsupported unit: {name}")
+
+
+def running_units():
+    names = docker_names()
+    units = [n for n in names if n in KINDS or n in ("sstp", "xray")]
+    if host_sstp_active():
+        units.append("sstp-host")
+    return units
+
+
+DRIVERS = {
+    "awg": {"info": awg_info, "dump": awg_dump, "params": awg_params,
+            "add": lambda u, a, s: awg_add(u, a.pub, a.name, a.ip, s), "remove": awg_remove,
+            "disable": awg_disable, "enable": awg_enable, "set-name": awg_set_name},
+    "sstp": {"info": sstp_info, "dump": sstp_dump, "params": sstp_params,
+             "add": lambda u, a, s: sstp_add(u, a.pub, a.name, s), "remove": sstp_remove,
+             "disable": lambda u, p: sstp_toggle(u, p, True), "enable": lambda u, p: sstp_toggle(u, p, False),
+             "set-name": sstp_set_name},
+    "vless": {"info": xr_info, "dump": xr_dump, "params": xr_params,
+              "add": lambda u, a, s: xr_add(u, a.pub, a.name), "remove": xr_remove,
+              "disable": lambda u, p: xr_toggle(u, p, True), "enable": lambda u, p: xr_toggle(u, p, False),
+              "set-name": xr_set_name},
+}
+
+
+def drv(name):
+    return DRIVERS[unit_kind(name)]
+
+
+def check_name(name):
+    if name and not NAME_RE.match(name):
+        raise Fail("bad name")
+
+
+def cmd_list(_a):
+    return [drv(u)["info"](u) for u in running_units()]
+
+
+def cmd_dump(a):
+    res = {}
+    for u in (a.containers or running_units()):
+        try:
+            res[u] = drv(u)["dump"](u)
+        except Fail as e:
+            res[u] = {"kind": unit_kind(u) if u in KINDS or u in ("sstp", "sstp-host", "xray") else "?",
+                      "up": False, "port": 0, "peers": [], "at": int(time.time()), "error": str(e)}
+    return res
+
+
+def cmd_params(a):
+    return drv(a.container)["params"](a.container)
+
+
+def cmd_next_ip(a):
+    if unit_kind(a.container) != "awg":
+        return {"ip": ""}
+    return awg_next_ip(a.container)
+
+
+def cmd_add(a):
+    check_name(a.name)
+    secret = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+    return drv(a.container)["add"](a.container, a, secret)
+
+
+def cmd_remove(a):
+    return drv(a.container)["remove"](a.container, a.pub)
+
+
+def cmd_disable(a):
+    return drv(a.container)["disable"](a.container, a.pub)
+
+
+def cmd_enable(a):
+    return drv(a.container)["enable"](a.container, a.pub)
+
+
+def cmd_set_name(a):
+    if not NAME_RE.match(a.name or ""):
+        raise Fail("bad name")
+    return drv(a.container)["set-name"](a.container, a.pub, a.name)
+
+
+# =====================================================================================
+# install / uninstall / preflight
+# =====================================================================================
+
+def say(msg):
+    print(f"[vpnctl] {msg}", flush=True)
+
+
+def public_ip():
+    p = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True)
+    m = re.search(r"\bsrc (\S+)", p.stdout)
+    return m.group(1) if m else ""
+
+
+def busy_ports(proto):
+    p = subprocess.run(["ss", "-Hln" + ("t" if proto == "tcp" else "u")], capture_output=True, text=True)
+    ports = set()
+    for line in p.stdout.splitlines():
+        f = line.split()
+        if len(f) >= 4:
+            port = f[3].rsplit(":", 1)[-1]
+            if port.isdigit():
+                ports.add(int(port))
+    return ports
+
+
+def pick_port(proto, wanted=None):
+    busy = busy_ports(proto)
+    if wanted:
+        if int(wanted) in busy:
+            raise Fail(f"{proto.upper()} port {wanted} is busy")
+        return int(wanted)
+    import secrets as _s
+    for _ in range(100):
+        p = 20000 + _s.randbelow(40000)
+        if p not in busy:
+            return p
+    raise Fail("no free port")
+
+
+def ensure_docker():
+    if subprocess.run(["sh", "-c", "command -v docker"], capture_output=True).returncode == 0:
+        return
+    say("docker is not installed — installing docker.io (apt)")
+    sh(["sh", "-c", "DEBIAN_FRONTEND=noninteractive apt-get update -qq && "
+                    "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io >/dev/null && systemctl enable --now docker"],
+       timeout=900)
+
+
+def ensure_image(proto):
+    local, remote = LOCAL_IMAGES[proto], REMOTE_IMAGES[proto]
+    if sh(["docker", "image", "inspect", local], check=False).returncode == 0:
+        return local
+    say(f"pulling {remote}")
+    sh(["docker", "pull", "-q", remote], timeout=900)
+    sh(["docker", "tag", remote, local])
+    return local
+
+
+def free_mb():
+    st = os.statvfs("/")
+    return st.f_bavail * st.f_frsize // (1024 * 1024)
+
+
+def wait_for(check, seconds=30):
+    for _ in range(seconds):
+        if check():
+            return True
+        time.sleep(1)
+    return False
+
+
+def install_awg3(a):
+    image = ensure_image("awg3")
+    script = os.path.join(LIB_DIR, "install-awg3.sh")
+    args = [script] + (["--port", str(a.port)] if a.port else [])
+    p = subprocess.run(args, capture_output=True, text=True, timeout=300, env=dict(os.environ, AWG3_IMAGE=image))
+    for line in (p.stdout + p.stderr).splitlines():
+        say(line.strip())
+    if p.returncode != 0:
+        raise Fail("install-awg3.sh failed")
+    return {"ok": True, "unit": "awg3", "port": awg_info("awg3")["port"]}
+
+
+SSTP_CONF_TEMPLATE = """[modules]
+log_file
+sstp
+auth_mschap_v2
+auth_mschap_v1
+auth_chap_md5
+auth_pap
+chap-secrets
+ippool
+
+[core]
+log-error=/var/log/accel-ppp/core.log
+thread-count=2
+
+[common]
+single-session=replace
+
+[log]
+log-file=/var/log/accel-ppp/accel-ppp.log
+level=3
+
+[sstp]
+verbose=1
+accept=ssl
+ssl-pemfile=/etc/accel-ppp/server.crt
+ssl-keyfile=/etc/accel-ppp/server.key
+bind=0.0.0.0
+port={port}
+ifname=sstp%d
+
+[ppp]
+verbose=1
+min-mtu=1280
+mtu=1400
+mru=1400
+ipv4=require
+ipv6=deny
+lcp-echo-interval=30
+lcp-echo-failure=3
+
+[auth]
+any-login=0
+
+[chap-secrets]
+chap-secrets=/etc/accel-ppp/chap-secrets
+
+[ip-pool]
+gw-ip-address=10.13.0.1
+10.13.0.2-254
+
+[dns]
+dns1=1.1.1.1
+dns2=1.0.0.1
+
+[cli]
+tcp=127.0.0.1:2001
+
+[client-ip-range]
+0.0.0.0/0
+"""
+
+
+def install_sstp(a):
+    if host_sstp_active():
+        say("note: a system accel-ppp is also running here; the container uses its own port")
+    if not os.path.exists("/dev/ppp") or subprocess.run(["sh", "-c", "lsmod | grep -q '^ppp_generic'"]).returncode:
+        say("loading kernel module ppp_generic")
+        sh(["modprobe", "ppp_generic"])
+        host_write("sstp", "/etc/modules-load.d/vpnctl-ppp.conf", "ppp_generic\n", 0o644)
+    image = ensure_image("sstp")
+    os.makedirs(SSTP_DIR, mode=0o700, exist_ok=True)
+    conf = f"{SSTP_DIR}/accel-ppp.conf"
+    if os.path.exists(conf) and not a.port:
+        port = int(ini_get(host_read(conf), "sstp", "port"))
+        say(f"keeping existing config (TCP {port})")
+    else:
+        port = pick_port("tcp", a.port)
+        host_write("sstp", conf, SSTP_CONF_TEMPLATE.format(port=port), 0o644)
+    if not os.path.exists(f"{SSTP_DIR}/chap-secrets"):
+        host_write("sstp", f"{SSTP_DIR}/chap-secrets", "", 0o600)
+    if not os.path.exists(f"{SSTP_DIR}/server.crt"):
+        ip = public_ip()
+        san = f"IP:{ip}" + (f",DNS:{a.domain}" if a.domain else "")
+        cn = a.domain or ip
+        say(f"self-signed certificate for {cn} (10 years)")
+        sh(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650", "-subj", f"/CN={cn}",
+            "-addext", f"subjectAltName={san}", "-keyout", f"{SSTP_DIR}/server.key", "-out", f"{SSTP_DIR}/server.crt"])
+        os.chmod(f"{SSTP_DIR}/server.key", 0o600)
+    sh(["docker", "rm", "-f", "sstp"], check=False)
+    sh(["docker", "run", "-d", "--name", "sstp", "--restart", "unless-stopped", "--cap-add", "NET_ADMIN",
+        "--device", "/dev/ppp", "--sysctl", "net.ipv4.ip_forward=1", "-p", f"{port}:{port}/tcp",
+        "-v", f"{SSTP_DIR}:/etc/accel-ppp", "--log-driver", "json-file", "--log-opt", "max-size=5m",
+        "--log-opt", "max-file=2", "--memory", "128m", image])
+    u = sstp_unit("sstp")
+    if not wait_for(lambda: accel(u, "show", "stat").returncode == 0, 30):
+        raise Fail("sstp container started but accel-ppp does not answer; see: docker logs sstp")
+    say(f"SSTP is running on TCP {port}")
+    return {"ok": True, "unit": "sstp", "port": port}
+
+
+SNI_CANDIDATES = ["www.apple.com", "dl.google.com", "www.microsoft.com"]
+
+
+def xr_selftest(image, port, pbk, sid, sni, flow="xtls-rprx-vision"):
+    """Real REALITY client on this host: temp user -> xray client (host network) -> HTTP 204 through the tunnel.
+    `xray tls ping` alone is not enough: www.microsoft.com passes it, yet REALITY handshakes to it fail."""
+    if subprocess.run(["sh", "-c", "command -v curl"], capture_output=True).returncode != 0:
+        say("curl is not installed — skipping the end-to-end self-test")
+        return True
+    import uuid as _u
+    tmp_id = str(_u.uuid4())
+    _, inbound, _, _ = xr_load()
+    xr_live_add(inbound, {"id": tmp_id, "email": tmp_id, "flow": flow})
+    socks = pick_port("tcp")
+    cfg = {"log": {"loglevel": "warning"},
+           "inbounds": [{"listen": "127.0.0.1", "port": socks, "protocol": "socks", "settings": {"udp": False}}],
+           "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1", "port": port,
+                          "users": [{"id": tmp_id, "encryption": "none", "flow": flow}]}]},
+                          "streamSettings": {"network": "tcp", "security": "reality",
+                                             "realitySettings": {"serverName": sni, "fingerprint": "chrome",
+                                                                 "publicKey": pbk, "shortId": sid}}}]}
+    sh(["docker", "rm", "-f", "vpnctl-selftest"], check=False)
+    ok = False
+    try:
+        sh(["docker", "run", "-d", "--name", "vpnctl-selftest", "--network", "host", "--entrypoint", "sh", image, "-c",
+            "cat > /tmp/c.json <<'JSON'\n" + json.dumps(cfg) + "\nJSON\nexec xray run -config /tmp/c.json"])
+        for _ in range(8):
+            time.sleep(1)
+            p = subprocess.run(["curl", "-s", "-o", "/dev/null", "-m", "6", "-w", "%{http_code}", "--socks5-hostname",
+                                f"127.0.0.1:{socks}", "http://cp.cloudflare.com/generate_204"], capture_output=True, text=True)
+            if p.stdout.strip() in ("204", "200"):
+                ok = True
+                break
+    finally:
+        sh(["docker", "rm", "-f", "vpnctl-selftest"], check=False)
+        xr_live_remove(tmp_id)
+    return ok
+
+
+def xr_write_config(port, priv, pub, sid, sni, clients):
+    f = xr_files()
+    cfg = {
+        "log": {"loglevel": "warning"},
+        "api": {"tag": "api", "listen": XRAY_API, "services": ["HandlerService", "StatsService"]},
+        "stats": {},
+        "policy": {"levels": {"0": {"statsUserUplink": True, "statsUserDownlink": True, "statsUserOnline": True}},
+                   "system": {"statsInboundUplink": True, "statsInboundDownlink": True}},
+        "inbounds": [{"tag": XRAY_TAG, "listen": "0.0.0.0", "port": port, "protocol": "vless",
+                      "settings": {"clients": clients, "decryption": "none"},
+                      "streamSettings": {"network": "tcp", "security": "reality",
+                                         "realitySettings": {"dest": f"{sni}:443", "serverNames": [sni],
+                                                             "privateKey": priv, "shortIds": [sid]}},
+                      "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}}],
+        "outbounds": [{"protocol": "freedom", "tag": "direct"}, {"protocol": "blackhole", "tag": "block"}],
+    }
+    host_write("xray", f["config"], json.dumps(cfg, ensure_ascii=False, indent=2))
+    host_write("xray", f["meta"], json.dumps({"port": port, "public_key": pub, "short_id": sid, "sni": sni,
+                                              "flow": "xtls-rprx-vision", "fp": "chrome"}, indent=2))
+    if not os.path.exists(f["disabled"]):
+        host_write("xray", f["disabled"], "[]")
+
+
+def xr_run(image, port):
+    sh(["docker", "rm", "-f", "xray"], check=False)
+    sh(["docker", "run", "-d", "--name", "xray", "--restart", "unless-stopped", "-p", f"{port}:{port}/tcp",
+        "-v", f"{XRAY_DIR}:/etc/xray", "--log-driver", "json-file", "--log-opt", "max-size=5m",
+        "--log-opt", "max-file=2", "--memory", "128m", image])
+    if not wait_for(xr_up, 30):
+        raise Fail("xray container started but its API does not answer; see: docker logs xray")
+
+
+def install_vless(a):
+    image = ensure_image("vless")
+    os.makedirs(XRAY_DIR, mode=0o700, exist_ok=True)
+    f = xr_files()
+    cfg = load_json_file(f["config"], None)
+    if cfg and not a.port and not a.sni:
+        meta = load_json_file(f["meta"], {})
+        port = next(i for i in cfg["inbounds"] if i.get("tag") == XRAY_TAG)["port"]
+        say(f"keeping existing config and users (TCP {port}, SNI {meta.get('sni')})")
+        xr_run(image, port)
+        return {"ok": True, "unit": "xray", "port": port, "sni": meta.get("sni")}
+    port = pick_port("tcp", a.port)
+    clients = next(i for i in cfg["inbounds"] if i.get("tag") == XRAY_TAG)["settings"]["clients"] if cfg else []
+    keys = sh(["docker", "run", "--rm", "--entrypoint", "xray", image, "x25519"]).stdout
+    priv = re.search(r"Private\s*[Kk]ey:\s*(\S+)", keys).group(1)
+    pub = re.search(r"(?:Public\s*key|Password \(PublicKey\)):\s*(\S+)", keys).group(1)
+    import secrets as _s
+    sid = _s.token_hex(4)
+    for sni in ([a.sni] if a.sni else SNI_CANDIDATES):
+        say(f"trying REALITY target {sni}")
+        ping = sh(["docker", "run", "--rm", "--entrypoint", "xray", image, "tls", "ping", sni], check=False, timeout=60)
+        if ping.returncode != 0 or "TLS ping finished" not in ping.stdout:
+            say(f"  {sni}: not reachable over TLS from this server")
+            continue
+        xr_write_config(port, priv, pub, sid, sni, clients)
+        xr_run(image, port)
+        if xr_selftest(image, port, pub, sid, sni):
+            say(f"VLESS REALITY is running on TCP {port} (SNI {sni}), self-test passed")
+            return {"ok": True, "unit": "xray", "port": port, "sni": sni}
+        say(f"  {sni}: REALITY self-test failed")
+    sh(["docker", "rm", "-f", "xray"], check=False)
+    raise Fail("no REALITY target worked from this server; try install vless --sni <host>")
+
+
+INSTALLERS = {"awg3": install_awg3, "sstp": install_sstp, "vless": install_vless}
+UNIT_OF = {"awg3": "awg3", "sstp": "sstp", "vless": "xray"}
+DATA_DIR = {"sstp": SSTP_DIR, "vless": XRAY_DIR}
+
+
+def cmd_install(a):
+    if os.geteuid() != 0:
+        raise Fail("install needs root")
+    if free_mb() < 300:
+        raise Fail(f"only {free_mb()} MB free on /, need at least 300 MB")
+    ensure_docker()
+    if systemd_enabled("netfilter-persistent"):
+        say("WARNING: netfilter-persistent is enabled — do not run 'netfilter-persistent save' while containers run")
+    return INSTALLERS[a.proto](a)
+
+
+def systemd_enabled(unit):
+    return subprocess.run(["systemctl", "is-enabled", "--quiet", unit], capture_output=True).returncode == 0
+
+
+def cmd_uninstall(a):
+    if os.geteuid() != 0:
+        raise Fail("uninstall needs root")
+    if a.proto == "awg3":
+        p = subprocess.run([os.path.join(LIB_DIR, "install-awg3.sh"), "--remove"], capture_output=True, text=True)
+        say((p.stdout + p.stderr).strip())
+        return {"ok": p.returncode == 0, "unit": "awg3", "kept": "/opt/awg3"}
+    unit = UNIT_OF[a.proto]
+    sh(["docker", "rm", "-f", unit], check=False)
+    kept = None
+    d = DATA_DIR[a.proto]
+    if os.path.isdir(d):
+        kept = f"{d}.removed-{time.strftime('%Y%m%d-%H%M%S')}"
+        os.rename(d, kept)
+    say(f"{unit} removed" + (f"; data moved to {kept}" if kept else ""))
+    return {"ok": True, "unit": unit, "kept": kept}
+
+
+def cmd_preflight(_a):
+    docker = subprocess.run(["sh", "-c", "command -v docker"], capture_output=True).returncode == 0
+    mem = {}
+    for line in (host_read("/proc/meminfo", "") or "").splitlines():
+        k, _, v = line.partition(":")
+        mem[k] = int(v.split()[0]) // 1024 if v.split() else 0
+    osr = {}
+    for line in (host_read("/etc/os-release", "") or "").splitlines():
+        k, _, v = line.partition("=")
+        osr[k] = v.strip('"')
+    return {"version": VERSION, "os": osr.get("PRETTY_NAME", "?"), "kernel": os.uname().release,
+            "docker": docker, "free_mb": free_mb(), "mem_avail_mb": mem.get("MemAvailable", 0),
+            "swap_mb": mem.get("SwapTotal", 0), "public_ip": public_ip(),
+            "ppp": os.path.exists("/dev/ppp") or subprocess.run(["modinfo", "ppp_generic"], capture_output=True).returncode == 0,
+            "units": running_units() if docker else (["sstp-host"] if host_sstp_active() else []),
+            "tcp_busy": sorted(busy_ports("tcp")), "udp_busy": sorted(busy_ports("udp")),
+            "netfilter_persistent": systemd_enabled("netfilter-persistent")}
+
+
+def cmd_unlink(_a):
+    """Remove the panel's key from authorized_keys (the panel forgets this server)."""
+    path = "/root/.ssh/authorized_keys"
+    lines = (host_read(path, "") or "").splitlines()
+    keep = [x for x in lines if "vpn-panel@" not in x]
+    host_write("ssh", path, "\n".join(keep) + ("\n" if keep else ""), 0o600)
+    return {"ok": True, "removed": len(lines) - len(keep)}
+
+
+def cmd_version(_a):
+    return {"version": VERSION}
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="vpnctl")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("list")
+    d = sub.add_parser("dump")
+    d.add_argument("containers", nargs="*")
+    for name in ("params", "next-ip"):
+        sub.add_parser(name).add_argument("container")
+    ad = sub.add_parser("add")
+    ad.add_argument("container")
+    ad.add_argument("--pub", required=True)
+    ad.add_argument("--ip", default="")
+    ad.add_argument("--name", default="")
+    for name in ("remove", "disable", "enable"):
+        x = sub.add_parser(name)
+        x.add_argument("container")
+        x.add_argument("--pub", required=True)
+    sn = sub.add_parser("set-name")
+    sn.add_argument("container")
+    sn.add_argument("--pub", required=True)
+    sn.add_argument("--name", required=True)
+    ins = sub.add_parser("install")
+    ins.add_argument("proto", choices=sorted(INSTALLERS))
+    ins.add_argument("--port", type=int)
+    ins.add_argument("--sni", default="")
+    ins.add_argument("--domain", default="")
+    un = sub.add_parser("uninstall")
+    un.add_argument("proto", choices=sorted(INSTALLERS))
+    for name in ("preflight", "unlink", "version"):
+        sub.add_parser(name)
+    return ap
+
+
+HANDLERS = {"list": cmd_list, "dump": cmd_dump, "params": cmd_params, "next-ip": cmd_next_ip,
+            "add": cmd_add, "remove": cmd_remove, "disable": cmd_disable, "enable": cmd_enable,
+            "set-name": cmd_set_name, "install": cmd_install, "uninstall": cmd_uninstall,
+            "preflight": cmd_preflight, "unlink": cmd_unlink, "version": cmd_version}
+WRITES = {"add", "remove", "disable", "enable", "set-name", "install", "uninstall", "unlink"}
+
+
+def main(argv):
+    if argv[:1] == ["--ssh"]:
+        # Forced command in authorized_keys: only "vpnctl <args>" (or the old name awgctl) runs.
+        orig = shlex.split(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
+        if not orig or os.path.basename(orig[0]) not in ("vpnctl", "awgctl"):
+            print(json.dumps({"error": "only vpnctl is allowed"}))
+            return 2
+        argv = orig[1:]
+    try:
+        a = build_parser().parse_args(argv)
+    except SystemExit:
+        print(json.dumps({"error": "bad arguments"}))
+        return 2
+    try:
+        with open(LOCK, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX if a.cmd in WRITES else fcntl.LOCK_SH)
+            print(json.dumps(HANDLERS[a.cmd](a), ensure_ascii=False), flush=True)
+        return 0
+    except (Fail, ValueError, KeyError, StopIteration, json.JSONDecodeError, subprocess.TimeoutExpired) as e:
+        print(json.dumps({"error": str(e) or e.__class__.__name__}, ensure_ascii=False), flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
