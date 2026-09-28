@@ -140,9 +140,9 @@ class PanelTest(unittest.TestCase):
         shutil.rmtree(cls.tmp)
 
     # ---- http helpers ----
-    def req(self, method, path, form=None, cookie=None):
+    def req(self, method, path, form=None, cookie=None, ua=None):
         conn = http.client.HTTPSConnection("127.0.0.1", self.port, context=ssl._create_unverified_context(), timeout=10)
-        headers, body = {}, None
+        headers, body = ({"User-Agent": ua} if ua else {}), None
         if form is not None:
             body = urllib.parse.urlencode(form, doseq=True)
             headers["Content-Type"] = "application/x-www-form-urlencoded"
@@ -279,6 +279,29 @@ class PanelTest(unittest.TestCase):
         del c[gone]
         poller.poll_all(self.cfg, self.db)
         self.assertIsNotNone(self.db.one("SELECT deleted FROM clients WHERE pub=?", (gone,))["deleted"])
+
+    def test_12_app_links_platform_first(self):
+        token, csrf = self.login()
+        _, h, _ = self.req("POST", "/new", {"csrf": csrf, "name": "Apps test", "target": "fin|awg3"}, cookie=token)
+        cid = int(re.search(r"/client/(\d+)", h["Location"]).group(1))
+        _, _, card = self.req("GET", f"/client/{cid}", cookie=token)
+        self.assertIn("Приложения для клиента", card)
+        self.assertIn("play.google.com/store/apps/details?id=org.amnezia.vpn", card)
+        links = []
+        for _ in range(2):
+            _, _, page = self.req("POST", f"/client/{cid}/share", {"csrf": csrf, "hours": "24"}, cookie=token)
+            links.append(re.search(r'value="https://[^"]+(/s/[A-Za-z0-9_-]+)"', page).group(1))
+        iphone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15"
+        android = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/128 Mobile"
+        _, _, p_ios = self.req("GET", links[0], ua=iphone)
+        self.assertLess(p_ios.index("apps.apple.com"), p_ios.index("play.google.com"), "iPhone: App Store first")
+        self.assertIn("DefaultVPN", p_ios)
+        self.assertIn("нет в российском App Store", p_ios)
+        self.assertIn("AWG 3.1", p_ios)
+        self.assertIn('rel="noopener noreferrer"', p_ios)
+        _, _, p_and = self.req("GET", links[1], ua=android)
+        self.assertLess(p_and.index("play.google.com"), p_and.index("apps.apple.com"), "Android: Google Play first")
+        self.assertNotIn('style="', p_and)
 
     def test_20_admin_account_sees_only_its_servers(self):
         token, csrf = self.login()

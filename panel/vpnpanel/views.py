@@ -347,7 +347,8 @@ def client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets, pro
 <p class="hint c">Сканируйте в {e(_app(kind))}: «+» → «QR-код».</p>
 <div class="row wrap"><a class="btn pri" download="{fname}.conf" href="data:text/plain;base64,{b64}">Скачать .conf</a>
 <button class="btn" type="button" data-copy="conf">Копировать текст</button></div>
-<textarea id="conf" readonly class="hidden-ta" tabindex="-1" aria-hidden="true">{e(conf)}</textarea></div></section>""")
+<textarea id="conf" readonly class="hidden-ta" tabindex="-1" aria-hidden="true">{e(conf)}</textarea></div>
+<div class="pb apps-pb"><div class="lb">Приложения для клиента</div>{apps_block(kind, "android", compact=True)}</div></section>""")
         side.append(_share_block(me, fmt, c, shares, new_link, now))
     elif not c["deleted"] and not protected:
         mig = _migrate_form(me, c, targets) if targets and not c["migrated_to"] else ""
@@ -406,14 +407,36 @@ def _share_block(me, fmt, c, shares, new_link, now):
 {table}</div></section>"""
 
 
+# ---------- app download links ----------
+
+def apps_block(kind, first="desktop", compact=False):
+    from .clientconf import PLATFORMS, VERSION_NOTE, app_links
+    links = app_links(kind)
+    order = sorted(PLATFORMS, key=lambda p: p[0] != first)
+    groups = []
+    for pid, title in order:
+        items = []
+        for name, url, where, note in links[pid]:
+            note_html = '<span class="anote">' + e(note) + '</span>' if note else ""
+            items.append(f'<a class="applink" href="{e(url)}" target="_blank" rel="noopener noreferrer">'
+                         f'<span class="an">{e(name)}</span><span class="aw">{e(where)}</span>{note_html}</a>')
+        first_cls = " first" if pid == first else ""
+        groups.append(f'<div class="apg{first_cls}"><div class="apt">{e(title)}</div>'
+                      f'<div class="apl">{"".join(items)}</div></div>')
+    note = VERSION_NOTE.get(kind or "")
+    note_html = f'<p class="note">{I_INFO}{e(note)}</p>' if note else ""
+    compact_cls = " compact" if compact else ""
+    return f'<div class="apps{compact_cls}">{"".join(groups)}</div>{note_html}'
+
+
 # ---------- public pages ----------
 
-def share_page(c, conf, kind, qr):
+def share_page(c, conf, kind, qr, platform="desktop"):
     b64 = base64.b64encode(conf.encode()).decode()
     return bare("Ваш VPN", f"""<div class="pubwrap"><main class="pub">
 <div class="head"><h1>Ваш VPN</h1><p class="muted">Подключение для: <strong>{e(c['name'])}</strong></p></div>
 <ol class="steps">
-<li><span class="n">1</span><div>Установите приложение <strong>{e(_app(kind))}</strong>.</div></li>
+<li><span class="n">1</span><div class="grow">Установите приложение — ссылки для вашего устройства первыми:{apps_block(kind, platform)}</div></li>
 <li><span class="n">2</span><div>В приложении нажмите «+» и выберите «QR-код» или «Файл».</div></li>
 <li><span class="n">3</span><div>Включите подключение.</div></li></ol>
 <div class="soft"><div class="qr" role="img" aria-label="QR-код для подключения">{qr}</div>

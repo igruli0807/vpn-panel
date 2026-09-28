@@ -390,7 +390,8 @@ def make_handler(app):
             except (OpError, runner.CtlError):
                 return self.send(503, views.server_down())
             db.event(f"открыта ссылка клиента «{c['name']}»", self.ip, None, c["server"])
-            self.send(200, views.share_page(c, conf, kind, clientconf.qr_svg(conf)))
+            self.send(200, views.share_page(c, conf, kind, clientconf.qr_svg(conf),
+                                            clientconf.platform_of(self.headers.get("User-Agent"))))
 
         # ---- journal ----
         def journal(self, me):

@@ -171,6 +171,23 @@ a{color:var(--accent)}
 .soft.msg{align-items:flex-start;padding:28px 22px;gap:12px;margin-top:40px}
 .soft .qr svg{width:260px}
 .center-screen{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:16px}
+/* приложения */
+.apps{display:flex;flex-direction:column;gap:12px;margin-top:10px}
+.apg .apt{font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px}
+.apl{display:flex;flex-direction:column;gap:6px}
+.applink{display:grid;grid-template-columns:1fr auto;gap:0 8px;align-items:center;padding:10px 12px;border:1px solid var(--line);border-radius:var(--r-m);background:var(--surface);color:var(--text);text-decoration:none;min-height:44px}
+.applink:hover{border-color:var(--accent)}
+.applink .an{font-weight:600}
+.applink .aw{font-size:12px;color:var(--accent);font-weight:600}
+.applink .anote{grid-column:1/-1;font-size:12px;color:var(--muted)}
+.apg.first .applink{border-color:var(--accent)}
+.apps.compact{margin-top:0}
+.apps.compact .apl{flex-direction:row;flex-wrap:wrap}
+.apps.compact .applink{padding:6px 10px;min-height:0}
+.apps.compact .apg.first .applink{border-color:var(--line)}
+.apps-pb{border-top:1px solid var(--line)}
+.pub .note{font-size:13px;margin-top:8px}
+.grow{flex-grow:1;min-width:0}
 /* адаптив */
 @media (max-width: 1100px){
   .grid2{grid-template-columns:minmax(0,1fr)}
