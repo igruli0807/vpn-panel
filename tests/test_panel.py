@@ -292,6 +292,17 @@ class PanelTest(unittest.TestCase):
         tot = self.db.one("SELECT SUM(rx) rx, SUM(tx) tx FROM traffic WHERE pub=?", (pub,))
         self.assertEqual((tot["rx"], tot["tx"]), (4000 + 200, 1000 + 100))
 
+    def test_10b_traffic_marks_last_seen(self):
+        c = FAKES["usa"].containers["xray"]["peers"]
+        uid = "11111111-2222-3333-4444-555555555555"
+        c[uid] = {"name": "vless seen", "ip": "", "disabled": False, "rx": 100, "tx": 100, "hs": 0}
+        poller.poll_all(self.cfg, self.db)
+        c[uid].update(rx=5000, tx=9000)
+        poller.poll_all(self.cfg, self.db)
+        hs = self.db.one("SELECT hs FROM peer_state WHERE pub=?", (uid,))["hs"]
+        self.assertGreater(hs, time.time() - 60, "traffic without a protocol timestamp still counts as seen")
+        del c[uid]
+
     def test_11_peer_removed_outside_panel_is_marked_deleted(self):
         c = FAKES["fin"].containers["amnezia-awg"]["peers"]
         gone = keys.pubkey(keys.genkey())

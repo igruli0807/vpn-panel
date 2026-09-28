@@ -44,9 +44,13 @@ def poll_server(cfg, db, server):
                 _sync_client(db, server["id"], container, p, now)
                 prev = db.conn.execute("SELECT rx, tx FROM peer_state WHERE server=? AND container=? AND pub=?",
                                        (server["id"], container, p["pub"])).fetchone()
+                seen = p["latest_handshake"]
                 if prev is not None and (p["rx"] or p["tx"]):
                     drx, dtx = _delta(p["rx"], prev["rx"]), _delta(p["tx"], prev["tx"])
                     if drx or dtx:
+                        # traffic since the last poll = the client was here, even if the protocol reports no
+                        # timestamp (VLESS online list is empty once the connection closed; SSTP between sessions)
+                        seen = max(seen, now)
                         db.conn.execute(
                             "INSERT INTO traffic VALUES(?,?,?,?,?,?) ON CONFLICT(server,container,pub,hour) "
                             "DO UPDATE SET rx=rx+excluded.rx, tx=tx+excluded.tx",
@@ -55,7 +59,7 @@ def poll_server(cfg, db, server):
                     "INSERT INTO peer_state VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(server,container,pub) DO UPDATE SET "
                     "rx=excluded.rx, tx=excluded.tx, hs=MAX(hs, excluded.hs), "
                     "endpoint=COALESCE(excluded.endpoint, endpoint), seen=excluded.seen",
-                    (server["id"], container, p["pub"], p["rx"], p["tx"], p["latest_handshake"],
+                    (server["id"], container, p["pub"], p["rx"], p["tx"], seen,
                      p["endpoint"], now))
             present = [p["pub"] for p in peers]
             marks = ",".join("?" * len(present)) or "''"
