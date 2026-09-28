@@ -71,6 +71,16 @@ CREATE TABLE IF NOT EXISTS tg_links (
   id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE,
   created INTEGER NOT NULL, expires INTEGER NOT NULL, used_at INTEGER
 );
+CREATE TABLE IF NOT EXISTS tg_requests (
+  id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, username TEXT, full_name TEXT,
+  status TEXT NOT NULL,                  -- pending | approved | rejected
+  targets TEXT,                          -- JSON [[server, container, label], ...] offered to the approvers
+  created INTEGER NOT NULL, decided INTEGER, decided_by INTEGER, client_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS tg_admin_links (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+  created INTEGER NOT NULL, expires INTEGER NOT NULL, used_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS invites (
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE,
   created INTEGER NOT NULL, expires INTEGER NOT NULL, used_at INTEGER
@@ -87,6 +97,7 @@ MIGRATIONS = [
     ("clients", "secret", "TEXT"),        # SSTP password (the server keeps it in chap-secrets anyway)
     ("clients", "tg_chat_id", "INTEGER"), # Telegram chat that pressed Start on this client's link
     ("clients", "email", "TEXT"),         # last address the config was mailed to
+    ("users", "tg_chat_id", "INTEGER"),   # panel user's Telegram chat: request notifications + approve buttons
 ]
 
 

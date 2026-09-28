@@ -89,7 +89,9 @@ def csrf_field(me):
 def layout(title, body, me=None, active="", page_cls="page"):
     nav = ""
     if me:
-        items = [("/", "Клиенты", "clients"), ("/new", "Добавить", "new"), ("/log", "Журнал", "log")]
+        n = me.get("pending_requests") or 0
+        items = [("/", "Клиенты", "clients"), ("/new", "Добавить", "new"),
+                 ("/requests", f"Заявки ({n})" if n else "Заявки", "requests"), ("/log", "Журнал", "log")]
         if me["role"] == "owner":
             items += [("/servers", "Серверы", "servers"), ("/users", "Учётки", "users"), ("/settings", "Настройки", "settings")]
         links = "".join(f'<a class="lnk{" on" if a == active else ""}" href="{h}">{t}</a>' for h, t, a in items)
@@ -685,7 +687,7 @@ def send_block(me, c, st, tg_link=""):
 
 # ---------- settings (owner) ----------
 
-def settings_page(me, st, smtp, error="", ok=""):
+def settings_page(me, st, smtp, error="", ok="", admin_link=""):
     msgs = (alert(ok, ok=True) if ok else "") + (alert(error) if error else "")
     sec = "".join(f'<option value="{v}"{" selected" if (smtp.get("smtp_security") or "starttls") == v else ""}>{t}</option>'
                   for v, t in (("starttls", "STARTTLS (587)"), ("ssl", "SSL/TLS (465)"), ("none", "без шифрования")))
@@ -698,6 +700,7 @@ def settings_page(me, st, smtp, error="", ok=""):
 <div class="field"><label class="lb" for="tgt">Токен бота</label><input id="tgt" name="tg_token" class="in tall mono" autocomplete="off" placeholder="123456:ABC…">
 <span class="hint">Пустое поле + «Сохранить» — отключить бота. Токен хранится в базе панели и целиком больше не показывается.</span></div>
 <button class="btn pri tall" type="submit">Проверить и сохранить</button></div></form>
+{_tg_admin_block(me, st, admin_link) if st["tg_ready"] else ""}
 </div><div class="col">
 <form class="panel" method="post" action="/settings/smtp">{csrf_field(me)}
 <div class="ph"><h2>Почта (SMTP)</h2></div><div class="pb">
@@ -711,6 +714,20 @@ def settings_page(me, st, smtp, error="", ok=""):
 <button class="btn pri tall" type="submit">Сохранить</button></div></form>
 </div></div>"""
     return layout("Настройки", body, me, "settings")
+
+
+def _tg_admin_block(me, st, link):
+    state = ('<p class="hint">Ваш Telegram привязан: заявки приходят вам с кнопками «выдать» / «отклонить».</p>'
+             if st.get("me_linked") else '<p class="hint">Привяжите свой Telegram — бот будет присылать вам заявки на VPN с кнопками одобрения.</p>')
+    box = ""
+    if link:
+        box = f"""<div class="linkbox"><div class="row between"><span class="lt">Откройте ссылку в своём Telegram</span><span class="small muted">1 час, один раз</span></div>
+<div class="row"><input id="adml" class="in mono grow" value="{e(link)}" readonly aria-label="Ссылка привязки">
+<button class="btn" type="button" data-copy="adml">Копировать</button></div>
+<p class="note">{I_INFO}Кто откроет её первым, тот и станет получать заявки — не пересылайте её.</p></div>"""
+    return f"""<form class="panel" method="post" action="/settings/tg-admin">{csrf_field(me)}
+<div class="ph"><h2>Заявки в мой Telegram</h2></div><div class="pb">{state}{box}
+<button class="btn tall" type="submit">{'Привязать заново' if st.get('me_linked') else 'Получить ссылку привязки'}</button></div></form>"""
 
 
 # ---------- servers (owner) ----------
@@ -813,3 +830,34 @@ def job_page(me, fmt, job, server_title):
 <section class="panel"><div class="ph"><h2>Журнал</h2>{'<span class="small muted">страница обновляется сама</span>' if running else ''}</div>
 <pre class="log">{e(job['log'])}</pre></section>"""
     return layout("Задача", body, me, "servers")
+
+
+# ---------- Telegram requests ----------
+
+def requests_page(me, fmt, pending, history, targets, bot_ready, approver_linked, error="", ok=""):
+    msgs = (alert(ok, ok=True) if ok else "") + (alert(error) if error else "")
+    tips = []
+    if not bot_ready:
+        tips.append("Бот не настроен — «Настройки» → Telegram.")
+    elif me["role"] == "owner" and not approver_linked:
+        tips.append("Привяжите свой Telegram в «Настройках» — заявки будут приходить вам с кнопками одобрения.")
+    topt = "".join(f'<option value="{e(t[0])}|{e(t[1])}">{e(t[2])}</option>' for t in targets)
+    rows = []
+    for r in pending:
+        approve = (f"""<form class="row wrap" method="post" action="/requests/{r['id']}/approve">{csrf_field(me)}
+<select name="target" class="in">{topt}</select><button class="btn pri" type="submit">Одобрить</button></form>""" if targets else
+                   '<span class="hint">нет доступных протоколов</span>')
+        rows.append(f"""<tr><td class="num">{e(fmt.dt(r['created'], short=True))}</td>
+<td><b>{e(r['full_name'] or '—')}</b><span class="sub">{('@' + e(r['username'])) if r['username'] else 'без username'} · id {e(r['chat_id'])}</span></td>
+<td>{approve}</td><td class="r"><form method="post" action="/requests/{r['id']}/reject" data-confirm="Отклонить заявку?">{csrf_field(me)}
+<button class="btn dng" type="submit">Отклонить</button></form></td></tr>""")
+    hist = "".join(f"""<tr class="dim"><td class="num">{e(fmt.dt(r['decided'], short=True))}</td><td>{e(r['full_name'] or r['username'] or r['chat_id'])}</td>
+<td>{'одобрена' if r['status'] == 'approved' else 'отклонена'}{(' · ' + e(r['decider'])) if r.get('decider') else ''}</td>
+<td class="r">{f'<a href="/client/{r["client_id"]}">клиент</a>' if r['client_id'] else ''}</td></tr>""" for r in history)
+    body = f"""<div class="head"><h1>Заявки из Telegram</h1><p class="muted">Человек пишет боту и жмёт «Запросить доступ». Конфиг он получит только после одобрения.</p></div>
+{msgs}{''.join('<div class="alert">' + I_INFO + '<div>' + e(t) + '</div></div>' for t in tips)}
+<section class="panel"><div class="ph"><h2>Ждут решения</h2><span class="count">{len(pending)}</span></div>
+{('<div class="scroll"><table class="t"><thead><tr><th>Когда</th><th>Кто</th><th>Что выдать</th><th></th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table></div>') if rows else '<p class="empty">Новых заявок нет.</p>'}</section>
+<section class="panel"><div class="ph"><h2>Решённые</h2></div>
+{('<div class="scroll"><table class="t dense"><thead><tr><th>Когда</th><th>Кто</th><th>Решение</th><th></th></tr></thead><tbody>' + hist + '</tbody></table></div>') if hist else '<p class="empty">Пока пусто.</p>'}</section>"""
+    return layout("Заявки", body, me, "requests")

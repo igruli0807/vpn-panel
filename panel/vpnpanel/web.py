@@ -9,7 +9,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import access, accounts, auth, clientconf, delivery, jobs, runner, servers, service, views
+from . import access, accounts, auth, clientconf, delivery, jobs, requests, runner, servers, service, views
 from .accounts import AccountError
 from .service import OpError
 
@@ -227,6 +227,8 @@ def make_handler(app):
                         return self.send(200, views.server_form_page(me, s_)) if s_ else self.nf(me)
                 if path == "/settings" and access.is_owner(me):
                     return self.settings_view(me)
+                if path == "/requests":
+                    return self.requests_view(me)
                 if path.startswith("/users"):
                     if not access.is_owner(me):
                         return self.nf(me)
@@ -269,6 +271,9 @@ def make_handler(app):
                 m = re.fullmatch(r"/client/(\d+)/(tg-link|tg-send|email)", path)
                 if m:
                     return self.deliver(me, int(m.group(1)), m.group(2), f)
+                m = re.fullmatch(r"/requests/(\d+)/(approve|reject)", path)
+                if m:
+                    return self.request_post(me, int(m.group(1)), m.group(2), f)
                 if path.startswith("/servers") and access.is_owner(me):
                     return self.servers_post(me, path, f)
                 if path.startswith("/settings/") and access.is_owner(me):
@@ -333,7 +338,8 @@ def make_handler(app):
         @staticmethod
         def notice(qs):
             return {"created": "Клиент создан. Покажите QR-код, создайте ссылку или отправьте в Telegram / на почту.",
-                    "removed": "Сервер убран из панели."}.get(qs.get("ok", ""), "")
+                    "removed": "Сервер убран из панели.",
+                    "approved": "Заявка одобрена: клиент создан, бот отправил ему настройки."}.get(qs.get("ok", ""), "")
 
         def dashboard(self, me, qs):
             filters = {k: (qs.get(k) or "").strip()[:64] for k in ("server", "container", "status", "q")}
@@ -484,10 +490,35 @@ def make_handler(app):
             self.nf(me)
 
         # ---- settings (owner) ----
-        def settings_view(self, me, error="", ok=""):
+        def settings_view(self, me, error="", ok="", admin_link=""):
             token = db.get("tg_token")
-            st = {"tg_ready": bool(token), "tg_username": db.get("tg_username") or "", "tg_masked": delivery.mask(token)}
-            self.send(400 if error else 200, views.settings_page(me, st, delivery.smtp_settings(db), error, ok))
+            linked = db.one("SELECT tg_chat_id FROM users WHERE id=?", (me["user_id"],))["tg_chat_id"]
+            st = {"tg_ready": bool(token), "tg_username": db.get("tg_username") or "", "tg_masked": delivery.mask(token),
+                  "me_linked": bool(linked)}
+            self.send(400 if error else 200, views.settings_page(me, st, delivery.smtp_settings(db), error, ok, admin_link))
+
+        def requests_view(self, me, error="", ok=""):
+            pending = db.q("SELECT * FROM tg_requests WHERE status='pending' ORDER BY id")
+            history = db.q("""SELECT r.*, u.login AS decider FROM tg_requests r LEFT JOIN users u ON u.id=r.decided_by
+                              WHERE r.status<>'pending' ORDER BY r.decided DESC LIMIT 50""")
+            if not access.is_owner(me):  # admins see decisions on their servers only
+                mine = set(access.servers(cfg, me))
+                history = [h for h in history if h["client_id"] and
+                           (db.one("SELECT server FROM clients WHERE id=?", (h["client_id"],)) or {}).get("server") in mine]
+            linked = db.one("SELECT tg_chat_id FROM users WHERE id=?", (me["user_id"],))["tg_chat_id"]
+            self.send(400 if error else 200, views.requests_page(me, fmt, pending, history, requests.targets(cfg, db, me),
+                                                                 bool(db.get("tg_token")), bool(linked), error, ok))
+
+        def request_post(self, me, rid, act, f):
+            try:
+                if act == "reject":
+                    requests.reject(db, rid, me["user_id"])
+                    return self.requests_view(me, ok=f"Заявка #{rid} отклонена.")
+                sid, container = (f.get("target") or "|").split("|", 1)
+                cid = requests.approve(cfg, db, rid, sid, container, me["user_id"], me)
+                return self.redirect(f"/client/{cid}?ok=approved")
+            except (requests.RequestError, OpError, runner.CtlError, delivery.DeliveryError, ValueError) as ex:
+                return self.requests_view(me, error=str(ex))
 
         def settings_post(self, me, what, f):
             try:
@@ -495,6 +526,9 @@ def make_handler(app):
                     username = delivery.tg_save(db, f.get("tg_token"))
                     self.event(me, "Telegram-бот " + (f"@{username} подключён" if username else "отключён"))
                     return self.settings_view(me, ok=(f"Бот @{username} подключён." if username else "Бот отключён."))
+                if what == "tg-admin":
+                    link = delivery.tg_admin_link(db, me["user_id"])
+                    return self.settings_view(me, admin_link=link)
                 if what == "smtp":
                     delivery.smtp_save(db, f)
                     self.event(me, "изменены настройки почты")

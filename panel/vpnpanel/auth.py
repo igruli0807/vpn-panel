@@ -95,6 +95,7 @@ def session(db, token):
                   WHERE s.token_hash=? AND u.disabled=0""", (_h(token),))
     if not s or s["expires"] < time.time():
         return None
+    s["pending_requests"] = db.one("SELECT COUNT(*) n FROM tg_requests WHERE status='pending'")["n"]
     return s
 
 

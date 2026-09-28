@@ -608,6 +608,74 @@ class PanelTest(unittest.TestCase):
             smtplib.SMTP = orig
             delivery.smtplib.SMTP = orig
 
+    def test_36_telegram_requests_with_approval(self):
+        token, csrf = self.login()
+        sent = []
+
+        def fake_tg(tok, method, fields=None, files=None, timeout=30):
+            sent.append((method, fields or {}, files or {}))
+            return {"username": "vpn_test_bot"} if method == "getMe" else {}
+        orig = delivery.tg_call
+        delivery.tg_call = fake_tg
+        T = "123:ABCDEFGHIJKLMNOP"
+        try:
+            self.req("POST", "/settings/telegram", {"csrf": csrf, "tg_token": T}, cookie=token)
+            _, _, page = self.req("POST", "/settings/tg-admin", {"csrf": csrf}, cookie=token)
+            link = re.search(r"start=(a_[A-Za-z0-9_-]+)", page).group(1)
+            delivery._handle_update(self.cfg, self.db, T, {"update_id": 10, "message": {"chat": {"id": 1001, "type": "private"}, "text": f"/start {link}"}})
+            self.assertEqual(self.db.one("SELECT tg_chat_id FROM users WHERE login='admin'")["tg_chat_id"], 1001)
+            sent.clear()
+            # a stranger asks for access
+            delivery._handle_update(self.cfg, self.db, T, {"update_id": 11, "message": {"chat": {"id": 555, "type": "private"}, "text": "/start"}})
+            self.assertIn("Запросить доступ", sent[-1][1]["reply_markup"])
+            sent.clear()
+            cb = lambda chat, data, uid=12: {"update_id": uid, "callback_query": {"id": "q", "data": data, "from": {"first_name": "Пётр", "username": "petr"},
+                                                                                "message": {"chat": {"id": chat}, "message_id": 7, "text": "📨 Заявка\n\nВыберите"}}}
+            delivery._handle_update(self.cfg, self.db, T, cb(555, "req"))
+            r = self.db.one("SELECT * FROM tg_requests WHERE chat_id=555")
+            self.assertEqual(r["status"], "pending")
+            to_owner = [x for x in sent if x[0] == "sendMessage" and x[1].get("chat_id") == 1001]
+            self.assertTrue(to_owner and "ap:" in to_owner[0][1]["reply_markup"], "owner gets approve buttons")
+            self.assertEqual(self.db.q("SELECT id FROM clients WHERE tg_chat_id=555"), [], "nothing is issued before approval")
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(555, "req", 13))
+            self.assertIn("уже", sent[-1][1]["text"], "one open request per chat")
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(555, f"ap:{r['id']}:0", 14))
+            self.assertIn("только владельцы", sent[-1][1]["text"], "a stranger cannot approve")
+            tl = json.loads(self.db.one("SELECT targets FROM tg_requests WHERE id=?", (r["id"],))["targets"])
+            i = next(i for i, t in enumerate(tl) if t[1] == "xray")
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(1001, f"ap:{r['id']}:{i}", 15))
+            c = self.db.one("SELECT * FROM clients WHERE tg_chat_id=555")
+            self.assertIsNotNone(c, "approved -> client created")
+            self.assertEqual((c["server"], c["container"]), ("usa", "xray"))
+            self.assertTrue(any(x[0] == "sendPhoto" and x[1].get("chat_id") == 555 for x in sent), "config sent to the requester")
+            self.assertTrue(any(x[0] == "editMessageText" and "Выдано" in x[1].get("text", "") for x in sent))
+            self.assertEqual(self.db.one("SELECT status FROM tg_requests WHERE id=?", (r["id"],))["status"], "approved")
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, {"update_id": 16, "message": {"chat": {"id": 555, "type": "private"}, "text": "/start"}})
+            self.assertIn("resend", sent[-1][1]["reply_markup"], "known user can ask for the settings again")
+            # second person: rejected from the panel, then cooldown
+            delivery._handle_update(self.cfg, self.db, T, cb(666, "req", 17))
+            r2 = self.db.one("SELECT * FROM tg_requests WHERE chat_id=666")
+            _, _, page = self.req("GET", "/requests", cookie=token)
+            self.assertIn("Пётр", page)
+            _, _, page = self.req("POST", f"/requests/{r2['id']}/reject", {"csrf": csrf}, cookie=token)
+            self.assertIn("отклонена", page)
+            self.assertTrue(any(x[1].get("chat_id") == 666 and "отклонили" in x[1].get("text", "") for x in sent))
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(666, "req", 18))
+            self.assertTrue(any("Попробуйте позже" in (x[1].get("text") or "") for x in sent), "cooldown after refusal")
+            # third person approved in the panel
+            delivery._handle_update(self.cfg, self.db, T, cb(777, "req", 19))
+            r3 = self.db.one("SELECT * FROM tg_requests WHERE chat_id=777")
+            st, h, _ = self.req("POST", f"/requests/{r3['id']}/approve", {"csrf": csrf, "target": "fin|awg3"}, cookie=token)
+            self.assertEqual(st, 303)
+            self.assertIn("ok=approved", h["Location"])
+        finally:
+            delivery.tg_call = orig
+
     def test_99_lockout_by_ip(self):
         # earlier tests already left a few failures from 127.0.0.1, so the block may come before the 5th try
         codes = [self.req("POST", "/login", {"login": "admin", "password": "wrong"})[0] for _ in range(5)]

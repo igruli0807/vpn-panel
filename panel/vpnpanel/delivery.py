@@ -137,16 +137,66 @@ def tg_send_client(cfg, db, c, chat_id):
     tg_call(token, "sendMessage", {"chat_id": chat_id, "text": "Это ваши личные данные для входа — не пересылайте их."})
 
 
-def _handle_update(cfg, db, token, upd):
-    msg = upd.get("message") or {}
-    chat = (msg.get("chat") or {}).get("id")
-    text = (msg.get("text") or "").strip()
-    if not chat or not text:
+def tg_admin_link(db, user_id, hours=1):
+    """One-time link that binds a panel user's Telegram (request notifications + approve buttons)."""
+    username = db.get("tg_username")
+    if not username:
+        raise DeliveryError("бот не настроен")
+    token = "a_" + secrets.token_urlsafe(20)
+    now = int(time.time())
+    db.x("INSERT INTO tg_admin_links(user_id, token_hash, created, expires) VALUES(?,?,?,?)",
+         (user_id, _h(token), now, now + hours * 3600))
+    return f"https://t.me/{username}?start={token}"
+
+
+def _kb(rows):
+    return json.dumps({"inline_keyboard": [[{"text": t, "callback_data": d} for t, d in row] for row in rows]},
+                      ensure_ascii=False)
+
+
+def _approvers(db):
+    return db.q("SELECT id, login, tg_chat_id FROM users WHERE role='owner' AND disabled=0 AND tg_chat_id IS NOT NULL")
+
+
+def _bound_client(db, chat):
+    return db.one("SELECT * FROM clients WHERE tg_chat_id=? AND deleted IS NULL AND disabled=0 ORDER BY id DESC LIMIT 1",
+                  (chat,))
+
+
+def _notify_approvers(cfg, db, token, r):
+    from . import requests as rq
+    tl = [list(t) for t in rq.targets(cfg, db)]
+    rq.save_targets(db, r["id"], tl)
+    rows = [[(t[2], f"ap:{r['id']}:{i}")] for i, t in enumerate(tl[:8])] + [[("✖ Отклонить", f"rj:{r['id']}")]]
+    text = (f"📨 Заявка на VPN #{r['id']}\n{rq.display_name(r)}\nTelegram id {r['chat_id']}\n\n"
+            + ("Выберите, что выдать:" if tl else "Нет доступных протоколов — одобрить можно в панели после установки."))
+    sent = 0
+    for a in _approvers(db):
+        try:
+            tg_call(token, "sendMessage", {"chat_id": a["tg_chat_id"], "text": text, "reply_markup": _kb(rows)})
+            sent += 1
+        except DeliveryError as e:
+            log.warning("notify approver %s: %s", a["login"], e)
+    return sent
+
+
+def _start(cfg, db, token, chat, arg, frm):
+    if arg.startswith("a_"):
+        link = db.one("SELECT * FROM tg_admin_links WHERE token_hash=? AND used_at IS NULL AND expires>?",
+                      (_h(arg), int(time.time())))
+        if not link:
+            tg_call(token, "sendMessage", {"chat_id": chat, "text": "Ссылка привязки недействительна или истекла."})
+            return
+        db.x("UPDATE tg_admin_links SET used_at=? WHERE id=?", (int(time.time()), link["id"]))
+        db.x("UPDATE users SET tg_chat_id=? WHERE id=?", (chat, link["user_id"]))
+        u = db.one("SELECT login FROM users WHERE id=?", (link["user_id"],))
+        tg_call(token, "sendMessage", {"chat_id": chat, "text": f"✅ Telegram привязан к учётке {u['login']}. "
+                                                                "Сюда будут приходить заявки на VPN с кнопками одобрения."})
+        db.event(f"Telegram привязан к учётке {u['login']}", None, link["user_id"])
         return
-    if text.startswith("/start"):
-        arg = text[6:].strip()
+    if arg:
         link = db.one("SELECT * FROM tg_links WHERE token_hash=? AND used_at IS NULL AND expires>?",
-                      (_h(arg), int(time.time()))) if arg else None
+                      (_h(arg), int(time.time())))
         c = db.one("SELECT * FROM clients WHERE id=? AND deleted IS NULL", (link["client_id"],)) if link else None
         if not c:
             tg_call(token, "sendMessage", {"chat_id": chat, "text": "Ссылка недействительна: истекла или уже использована. "
@@ -154,15 +204,94 @@ def _handle_update(cfg, db, token, upd):
             return
         db.x("UPDATE tg_links SET used_at=? WHERE id=?", (int(time.time()), link["id"]))
         db.x("UPDATE clients SET tg_chat_id=? WHERE id=?", (chat, c["id"]))
-        try:
-            tg_send_client(cfg, db, c, chat)
-            db.event(f"конфиг «{c['name']}» отправлен в Telegram (по ссылке)", None, None, c["server"])
-        except (DeliveryError, service.OpError, Exception) as e:
-            log.warning("tg send failed: %s", e)
-            tg_call(token, "sendMessage", {"chat_id": chat, "text": "Не получилось собрать конфиг — сервер недоступен. "
-                                                                    "Попробуйте позже или напишите администратору."})
-    else:
-        tg_call(token, "sendMessage", {"chat_id": chat, "text": "Этот бот присылает настройки VPN по ссылке от администратора."})
+        _send_or_apologise(cfg, db, token, c, chat, "по ссылке")
+        return
+    rows = [[("🔑 Запросить доступ к VPN", "req")]]
+    if _bound_client(db, chat):
+        rows.insert(0, [("📄 Прислать мои настройки ещё раз", "resend")])
+    tg_call(token, "sendMessage", {"chat_id": chat, "reply_markup": _kb(rows),
+                                   "text": "Здравствуйте! Этот бот выдаёт настройки VPN. Доступ выдаётся после одобрения администратора."})
+
+
+def _send_or_apologise(cfg, db, token, c, chat, how):
+    try:
+        tg_send_client(cfg, db, c, chat)
+        db.event(f"конфиг «{c['name']}» отправлен в Telegram ({how})", None, None, c["server"])
+    except Exception as e:  # server unreachable, etc.
+        log.warning("tg send failed: %s", e)
+        tg_call(token, "sendMessage", {"chat_id": chat, "text": "Не получилось собрать настройки — сервер недоступен. "
+                                                                "Попробуйте позже или напишите администратору."})
+
+
+def _callback(cfg, db, token, cq):
+    from . import requests as rq
+    data = cq.get("data") or ""
+    chat = ((cq.get("message") or {}).get("chat") or {}).get("id")
+    frm = cq.get("from") or {}
+    answer = ""
+    try:
+        if data == "req":
+            full = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
+            r, new = rq.create(db, chat, frm.get("username"), full)
+            if new:
+                n = _notify_approvers(cfg, db, token, r)
+                db.event(f"заявка #{r['id']} от {rq.display_name(r)} в Telegram", None)
+                tg_call(token, "sendMessage", {"chat_id": chat, "text": "Заявка отправлена. Как только администратор одобрит, "
+                                                                        "бот пришлёт настройки сюда."})
+                if not n:
+                    log.warning("request %s: no approver has linked Telegram", r["id"])
+            else:
+                answer = "Заявка уже на рассмотрении"
+        elif data == "resend":
+            c = _bound_client(db, chat)
+            if c:
+                _send_or_apologise(cfg, db, token, c, chat, "повторно по просьбе")
+            else:
+                answer = "Настроек для вас нет"
+        elif data.startswith(("ap:", "rj:")):
+            u = db.one("SELECT * FROM users WHERE tg_chat_id=? AND role='owner' AND disabled=0", (chat,))
+            if not u:
+                answer = "Одобрять могут только владельцы панели"
+            else:
+                parts = data.split(":")
+                rid = int(parts[1])
+                r = rq.get(db, rid)
+                if data.startswith("rj:"):
+                    rq.reject(db, rid, u["id"])
+                    result = f"✖ Отклонено ({u['login']})"
+                else:
+                    tl = json.loads(r["targets"] or "[]")
+                    sid, container, label = tl[int(parts[2])]
+                    rq.approve(cfg, db, rid, sid, container, u["id"])
+                    result = f"✅ Выдано: {label} ({u['login']})"
+                msg = cq.get("message") or {}
+                try:
+                    tg_call(token, "editMessageText", {"chat_id": chat, "message_id": msg.get("message_id"),
+                                                       "text": (msg.get("text") or "").split("\n\n")[0] + "\n\n" + result})
+                except DeliveryError:
+                    pass
+    except rq.RequestError as e:
+        answer = str(e)
+    except (service.OpError, DeliveryError, ValueError, IndexError) as e:
+        answer = f"Ошибка: {e}"[:190]
+    try:
+        tg_call(token, "answerCallbackQuery", {"callback_query_id": cq.get("id"), "text": answer[:190]})
+    except DeliveryError:
+        pass
+
+
+def _handle_update(cfg, db, token, upd):
+    if upd.get("callback_query"):
+        return _callback(cfg, db, token, upd["callback_query"])
+    msg = upd.get("message") or {}
+    chat = (msg.get("chat") or {}).get("id")
+    text = (msg.get("text") or "").strip()
+    if not chat or not text or (msg.get("chat") or {}).get("type", "private") != "private":
+        return
+    if text.startswith("/start"):
+        return _start(cfg, db, token, chat, text[6:].strip(), msg.get("from") or {})
+    tg_call(token, "sendMessage", {"chat_id": chat, "reply_markup": _kb([[("🔑 Запросить доступ к VPN", "req")]]),
+                                   "text": "Этот бот выдаёт настройки VPN после одобрения администратора."})
 
 
 def bot_loop(cfg, db):
@@ -173,7 +302,8 @@ def bot_loop(cfg, db):
             continue
         try:
             offset = int(db.get("tg_offset") or 0)
-            updates = tg_call(token, "getUpdates", {"offset": offset, "timeout": 50, "allowed_updates": '["message"]'},
+            updates = tg_call(token, "getUpdates", {"offset": offset, "timeout": 50,
+                                                    "allowed_updates": '["message","callback_query"]'},
                               timeout=65)
             for upd in updates:
                 db.set("tg_offset", str(upd["update_id"] + 1))
