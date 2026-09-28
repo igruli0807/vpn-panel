@@ -13,9 +13,17 @@
 - панель — один процесс Python из стандартной библиотеки (+ вложенный `segno` для QR), ~25 МБ памяти,
   без Docker, без базы данных-сервера, без CDN.
 
-Поддерживаемые контейнеры: `awg3` (ставит этот пакет), `amnezia-awg2`, `amnezia-awg` (Legacy),
-`amnezia-wireguard` (созданные приложением Amnezia). SSTP и VLESS — в планах, установщик уже
-знает эти ключи (`--proto sstp|vless`) и честно отвечает, что их пока нет.
+Протоколы:
+- **AmneziaWG 3.1** — контейнер `awg3` (ставит этот пакет); плюс управление контейнерами приложения Amnezia
+  (`amnezia-awg2`, `amnezia-awg` Legacy, `amnezia-wireguard`);
+- **VLESS REALITY** — контейнер `xray` (Xray 26.3.27), пользователи добавляются на лету; установщик сам
+  проверяет REALITY настоящим клиентом и подбирает рабочий SNI;
+- **SSTP** — контейнер `sstp` (accel-ppp 1.14.0) или уже стоящий системный accel-ppp.
+
+Серверы добавляются **из панели** («Серверы» → «Добавить»): SSH-адрес и root-пароль или ключ — один раз, чтобы
+положить на сервер `vpnctl` и ключ панели, который умеет только управлять VPN. Протоколы ставятся и удаляются
+кнопкой, журнал установки виден на странице. Конфиг клиенту можно отправить **в Telegram** (свой бот панели,
+пользователь жмёт Start по ссылке) или **на почту** (SMTP) — «Настройки».
 
 ## Установка
 
@@ -25,7 +33,7 @@
 git clone https://github.com/igruli0807/vpn-panel /opt/vpn-panel && cd /opt/vpn-panel
 
 # 1. VPN-сервер: AmneziaWG 3.1 в контейнере "awg3" (ключи, обфускация и порт — сами)
-./install.sh server --proto awg3
+./install.sh server --proto awg3          # или sstp / vless (можно и кнопкой из панели)
 
 # 2. Панель (на том же или на другом хосте); контейнеры этого хоста подключатся автоматически
 ./install.sh panel --id fin --title "Финляндия" --tz Europe/Helsinki
@@ -40,7 +48,8 @@ vpn-panel-passwd && systemctl start vpn-panel      # пароль владель
 
 Панель откроется на `https://<IP>:2053`. Сертификат самоподписанный: браузер один раз предупредит.
 
-Удалить AWG 3.1 с сервера: `./install.sh server --remove --proto awg3` (ключи остаются в `/opt/awg3`).
+Удалить протокол: кнопкой в «Серверах» или `./install.sh server --remove --proto awg3|sstp|vless`
+(данные остаются на сервере в стороне).
 
 ## Как устроено
 
@@ -52,7 +61,8 @@ vpn-panel-passwd && systemctl start vpn-panel      # пароль владель
                     awgctl ──docker exec──▶ awg3 / amnezia-awg2 / amnezia-awg / amnezia-wireguard
 ```
 
-- `server/awgctl` — единственная точка изменений на VPN-сервере. Правит конфиг атомарно (с копией
+- `server/vpnctl` (бывший `awgctl`, имя оставлено ссылкой) — единственная точка изменений на VPN-сервере:
+  драйверы AWG / SSTP / VLESS, `install` / `uninstall` / `preflight` / `unlink`. Правит конфиг атомарно (с копией
   предыдущих 20 версий в `/var/backups/awgctl`), применяет к живому интерфейсу без разрыва сессий,
   для контейнеров Amnezia обновляет `clientsTable`, чтобы приложение видело те же имена. Приватные
   и preshared-ключи наружу не отдаёт никогда. Отключённые клиенты лежат в `<conf>.disabled`.
@@ -102,7 +112,8 @@ vpn-panel-passwd && systemctl start vpn-panel      # пароль владель
 ```bash
 python3 -m unittest discover -s tests -p 'test_*.py'   # панель, без серверов (поддельный awgctl)
 sudo tests/smoke-awg3.sh                                 # рукопожатие AWG 3.1 между двумя контейнерами
-sudo tests/test-awgctl.sh                                # awgctl против настоящих контейнеров
+sudo tests/test-awgctl.sh                                # AWG-драйвер против настоящих контейнеров
+sudo tests/test-vpnctl.sh                                # SSTP и VLESS: установка + настоящие клиенты sstpc и xray
 ```
 
 Бриф для дизайна интерфейса — [`docs/design-brief.md`](docs/design-brief.md).

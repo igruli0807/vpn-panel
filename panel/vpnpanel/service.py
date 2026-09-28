@@ -1,4 +1,4 @@
-"""Client operations used by the web layer. Every change goes through awgctl first; the panel DB
+"""Client operations used by the web layer. Every change goes through vpnctl first; the panel DB
 is updated only after the server confirmed it."""
 import hashlib
 import ipaddress
@@ -8,8 +8,12 @@ import time
 from . import clientconf, keys, runner
 
 # Where each container kind can be managed from the panel.
-CAN_ADD = {"awg3", "awg2"}
-KIND_TITLE = {"awg3": "AWG 3.1", "awg2": "AWG 2.0", "legacy": "AWG Legacy", "wireguard": "WireGuard"}
+CAN_ADD = {"awg3", "awg2", "sstp", "vless"}
+KIND_TITLE = {"awg3": "AWG 3.1", "awg2": "AWG 2.0", "legacy": "AWG Legacy", "wireguard": "WireGuard",
+              "sstp": "SSTP", "vless": "VLESS"}
+AWG_KINDS = {"awg3", "awg2", "legacy", "wireguard"}
+_LOGIN_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+_PASS_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
 
 
 class OpError(Exception):
@@ -28,7 +32,11 @@ def container_kind(db, sid, container):
     return r["kind"] if r else None
 
 
-def create_client(cfg, db, sid, container, name, ip=None):
+def _rand(alphabet, n):
+    return "".join(secrets.choice(alphabet) for _ in range(n))
+
+
+def create_client(cfg, db, sid, container, name, ip=None, login=None):
     s = _server(cfg, sid)
     kind = container_kind(db, sid, container)
     if kind not in CAN_ADD:
@@ -36,19 +44,42 @@ def create_client(cfg, db, sid, container, name, ip=None):
     name = (name or "").strip()[:64]
     if not name:
         raise OpError("нужно имя клиента")
-    priv = keys.genkey()
-    pub, psk = keys.pubkey(priv), keys.genpsk()
-    if not ip:
-        ip = runner.run(cfg, s, "next-ip", container)["ip"]
+    priv = psk = secret = None
+    if kind in AWG_KINDS:
+        priv = keys.genkey()
+        pub, psk = keys.pubkey(priv), keys.genpsk()
+        stdin = psk + "\n"
+        if not ip:
+            ip = runner.run(cfg, s, "next-ip", container)["ip"]
+        args = ["--pub", pub, "--ip", ip]
+    elif kind == "sstp":
+        pub = (login or "").strip().lower() or "u" + _rand(_LOGIN_ALPHABET, 7)
+        secret = _rand(_PASS_ALPHABET, 16)
+        stdin, ip, args = secret + "\n", "", ["--pub", pub]
+    else:  # vless
+        import uuid
+        pub, stdin, ip, args = str(uuid.uuid4()), "", "", None
+        args = ["--pub", pub]
     try:
-        runner.run(cfg, s, "add", container, "--pub", pub, "--ip", ip, "--name", name, stdin=psk + "\n")
+        runner.run(cfg, s, "add", container, *args, "--name", name, stdin=stdin)
     except runner.CtlError as e:
         raise OpError(str(e))
-    cid = db.x("INSERT INTO clients(server, container, pub, name, ip, priv, psk, source, created) "
-               "VALUES(?,?,?,?,?,?,?,'panel',?) ON CONFLICT(server,container,pub) DO UPDATE SET "
-               "name=excluded.name, priv=excluded.priv, psk=excluded.psk, source='panel', deleted=NULL",
-               (sid, container, pub, name, ip, priv, psk, int(time.time())))
-    return db.one("SELECT id FROM clients WHERE server=? AND container=? AND pub=?", (sid, container, pub))["id"] or cid
+    db.x("INSERT INTO clients(server, container, pub, name, ip, priv, psk, secret, source, created) "
+         "VALUES(?,?,?,?,?,?,?,?,'panel',?) ON CONFLICT(server,container,pub) DO UPDATE SET "
+         "name=excluded.name, priv=excluded.priv, psk=excluded.psk, secret=excluded.secret, source='panel', deleted=NULL",
+         (sid, container, pub, name, ip or "", priv, psk, secret, int(time.time())))
+    return db.one("SELECT id FROM clients WHERE server=? AND container=? AND pub=?", (sid, container, pub))["id"]
+
+
+def has_config(c):
+    """Panel can hand out a config only for clients it created (it holds their key / password)."""
+    return bool(c.get("priv") or c.get("secret") or (c.get("source") == "panel" and c.get("kind") == "vless")
+                or (c.get("source") == "panel" and _is_uuid(c.get("pub"))))
+
+
+def _is_uuid(v):
+    import re
+    return bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", v or ""))
 
 
 def get_client(db, cid):
@@ -85,7 +116,7 @@ def enable(cfg, db, cid):
 
 def delete(cfg, db, cid):
     _op(cfg, db, cid, "remove")
-    db.x("UPDATE clients SET deleted=?, priv=NULL, psk=NULL WHERE id=?", (int(time.time()), cid))
+    db.x("UPDATE clients SET deleted=?, priv=NULL, psk=NULL, secret=NULL WHERE id=?", (int(time.time()), cid))
     db.x("UPDATE shares SET revoked=? WHERE client_id=? AND revoked IS NULL", (int(time.time()), cid))
 
 
@@ -129,13 +160,12 @@ def migrate(cfg, db, cid, target_sid, target_container):
 
 
 def client_config(cfg, db, c):
-    if not c.get("priv"):
+    if not has_config(c):
         raise OpError("у этого клиента нет ключа в панели (он создан в приложении Amnezia) — "
                       "выдайте ему новый конфиг через «Перевести на AWG 3.1»")
     s = _server(cfg, c["server"])
     params = runner.run(cfg, s, "params", c["container"])
-    return clientconf.render(params, private_key=c["priv"], address=c["ip"], preshared_key=c["psk"],
-                             endpoint_host=s["endpoint"]), params["kind"]
+    return clientconf.build(params, c, s["endpoint"])
 
 
 # ---------- share links ----------
@@ -146,7 +176,7 @@ def _h(token):
 
 def create_share(cfg, db, cid, hours=None, one_time=False):
     c = get_client(db, cid)
-    if not c.get("priv") or c.get("deleted"):
+    if not has_config(c) or c.get("deleted"):
         raise OpError("для этого клиента нельзя сделать ссылку")
     token = secrets.token_urlsafe(32)
     now = int(time.time())

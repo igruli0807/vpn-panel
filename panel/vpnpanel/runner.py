@@ -1,4 +1,4 @@
-"""Run awgctl on a VPN server: locally (through sudo) or over SSH (forced command on the far side)."""
+"""Run vpnctl on a VPN server: locally (through sudo) or over SSH (forced command on the far side)."""
 import json
 import os
 import shlex
@@ -24,7 +24,7 @@ def command(cfg, server, args):
             "-o", f"UserKnownHostsFile={os.path.join(os.path.dirname(cfg['db']), 'known_hosts')}",
             *mux, "-o", "LogLevel=ERROR",
             f"{server.get('ssh_user', 'root')}@{server['ssh_host']}",
-            "awgctl " + " ".join(shlex.quote(str(a)) for a in args)]
+            "vpnctl " + " ".join(shlex.quote(str(a)) for a in args)]
 
 
 def run(cfg, server, *args, stdin="", timeout=40):
@@ -40,6 +40,35 @@ def run(cfg, server, *args, stdin="", timeout=40):
         data = None
     if data is None:
         raise CtlError(f"{server['id']}: {p.stderr.strip()[:300] or 'no output'}")
+    if isinstance(data, dict) and "error" in data:
+        raise CtlError(f"{server['id']}: {data['error']}")
+    return data
+
+
+def stream(cfg, server, *args, on_line=None, timeout=1500):
+    """Like run(), but hands every output line to on_line() while the command runs (long installs)."""
+    import time as _t
+    p = subprocess.Popen(command(cfg, server, args), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT, text=True, bufsize=1)
+    last, deadline = "", _t.time() + timeout
+    try:
+        for line in p.stdout:
+            line = line.rstrip("\n")
+            if line.strip():
+                last = line
+                if on_line:
+                    on_line(line)
+            if _t.time() > deadline:
+                p.kill()
+                raise CtlError(f"{server['id']}: timeout")
+        p.wait(timeout=30)
+    finally:
+        if p.poll() is None:
+            p.kill()
+    try:
+        data = json.loads(last)
+    except json.JSONDecodeError:
+        raise CtlError(f"{server['id']}: {last[:300] or 'no output'}")
     if isinstance(data, dict) and "error" in data:
         raise CtlError(f"{server['id']}: {data['error']}")
     return data

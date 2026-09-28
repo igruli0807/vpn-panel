@@ -5,9 +5,10 @@
 #       install the web panel on this host (and register this host's VPN containers, if any)
 #   ./install.sh add-server --id usa --title "США" --host IP [--ssh-port 22] [--endpoint IP]
 #       run on the panel host: connect another VPN server (uses your root SSH access once)
-#   ./install.sh server --proto awg3 [--port N]
-#       run on a VPN host: install AmneziaWG 3.1 (docker container "awg3") + awgctl
-#   ./install.sh server --remove --proto awg3
+#   ./install.sh server --proto awg3|sstp|vless [--port N] [--sni HOST]
+#       run on a VPN host: install a protocol in docker (awg3 / sstp / xray container) + vpnctl
+#   ./install.sh server --remove --proto awg3|sstp|vless
+#   Servers can also be added and protocols installed from the panel UI («Серверы»).
 #
 # Re-running any mode is safe. Nothing secret is written into the repository directory.
 set -euo pipefail
@@ -17,9 +18,8 @@ PREFIX=/opt/vpn-panel
 ETC=/etc/vpn-panel
 LIB=/var/lib/vpn-panel
 USER_=vpnpanel
-IMAGE_TAG=3.1.20260828
-IMAGE="awg3:$IMAGE_TAG"
-GHCR_IMAGE="${AWG3_GHCR_IMAGE:-ghcr.io/igruli0807/awg3:$IMAGE_TAG}"
+declare -A IMAGE_OF=([awg3]="awg3:3.1.20260828" [sstp]="sstp:1.14.0" [vless]="xray:26.3.27")
+GHCR=${VPN_PANEL_GHCR:-ghcr.io/igruli0807}
 
 say() { echo -e "\033[1m[vpn-panel]\033[0m $*"; }
 die() { echo "[vpn-panel] ERROR: $*" >&2; exit 1; }
@@ -33,8 +33,11 @@ sync_code() {
   fi
 }
 
-install_awgctl() {
-  install -m 755 "$PREFIX/server/awgctl" /usr/local/sbin/awgctl
+install_vpnctl() {
+  install -m 755 "$PREFIX/server/vpnctl" /usr/local/sbin/vpnctl
+  ln -sf vpnctl /usr/local/sbin/awgctl
+  install -d -m 755 /usr/local/lib/vpnctl
+  install -m 755 "$PREFIX/server/install-awg3.sh" /usr/local/lib/vpnctl/install-awg3.sh
 }
 
 install_guard() {
@@ -72,6 +75,8 @@ cmd_panel() {
   command -v python3 >/dev/null || die "python3 is required"
   python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || die "python3 >= 3.9 is required"
   for b in openssl sudo ssh ssh-keygen; do command -v $b >/dev/null || die "$b is required (apt install $b)"; done
+  # sshpass lets the panel connect a new server by root password once (the password is never stored)
+  command -v sshpass >/dev/null || { say "installing sshpass"; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sshpass >/dev/null || say "WARNING: sshpass not installed — servers can be added by key only"; }
   endpoint=${endpoint:-$(public_ip)}
   sync_code
 
@@ -98,15 +103,16 @@ PY
     chown root:$USER_ $ETC/config.json; chmod 640 $ETC/config.json
   fi
 
-  # This host runs VPN containers too -> manage them locally through sudo awgctl.
-  if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^(awg3|amnezia-(awg2?|wireguard))$'; then
-    install_awgctl; install_guard
+  # This host runs VPN containers too -> manage them locally through sudo vpnctl.
+  if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^(awg3|sstp|xray|amnezia-(awg2?|wireguard))$' \
+     || systemctl is-active --quiet accel-ppp 2>/dev/null; then
+    install_vpnctl; command -v docker >/dev/null && install_guard
     id=${id:-$(hostname -s)}; title=${title:-$id}
     json_edit $ETC/config.json "
 s=[x for x in d['servers'] if x['id']!='$id']
 s.insert(0, {'id': '$id', 'title': '''$title''', 'endpoint': '$endpoint', 'transport': 'local'})
 d['servers']=s"
-    echo "$USER_ ALL=(root) NOPASSWD: /usr/local/sbin/awgctl" > /etc/sudoers.d/vpn-panel
+    echo "$USER_ ALL=(root) NOPASSWD: /usr/local/sbin/vpnctl, /usr/local/sbin/awgctl" > /etc/sudoers.d/vpn-panel
     chmod 440 /etc/sudoers.d/vpn-panel
     visudo -cf /etc/sudoers.d/vpn-panel >/dev/null || { rm -f /etc/sudoers.d/vpn-panel; die "sudoers check failed"; }
     say "local VPN containers registered as server '$id'"
@@ -143,11 +149,13 @@ cmd_add_server() {
   me=$(public_ip)
   pub=$(cat $ETC/ssh/id_ed25519.pub)
   say "connecting to root@$host (your own SSH key or password, once)"
-  scp -P "$sshport" -q "$PREFIX/server/awgctl" "root@$host:/usr/local/sbin/awgctl"
-  ssh -p "$sshport" "root@$host" "chmod 755 /usr/local/sbin/awgctl; mkdir -p /root/.ssh; chmod 700 /root/.ssh;
+  tar -C "$PREFIX/server" -cf - vpnctl install-awg3.sh awg-guard.sh awg-guard.service awg-guard.timer | \
+    ssh -p "$sshport" "root@$host" "mkdir -p /usr/local/lib/vpnctl && tar -C /usr/local/lib/vpnctl -xf - &&
+      install -m 755 /usr/local/lib/vpnctl/vpnctl /usr/local/sbin/vpnctl && ln -sf vpnctl /usr/local/sbin/awgctl"
+  ssh -p "$sshport" "root@$host" "mkdir -p /root/.ssh; chmod 700 /root/.ssh;
     touch /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys;
     grep -v 'vpn-panel@' /root/.ssh/authorized_keys > /root/.ssh/authorized_keys.tmp || true;
-    echo 'command=\"/usr/local/sbin/awgctl --ssh\",from=\"$me\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding $pub' >> /root/.ssh/authorized_keys.tmp;
+    echo 'command=\"/usr/local/sbin/vpnctl --ssh\",from=\"$me\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding $pub' >> /root/.ssh/authorized_keys.tmp;
     mv /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys"
   json_edit $ETC/config.json "
 s=[x for x in d['servers'] if x['id']!='$id']
@@ -157,37 +165,35 @@ d['servers']=s"
   systemctl restart vpn-panel 2>/dev/null || true
   sudo -u $USER_ env PYTHONPATH=$PREFIX/panel:$PREFIX/panel/vendor VPN_PANEL_CONFIG=$ETC/config.json \
     python3 -m vpnpanel poll-once >/dev/null && say "server '$id' connected and polled" \
-    || die "server '$id' added but polling failed: check docker/awgctl on $host"
+    || die "server '$id' added but polling failed: check docker/vpnctl on $host"
 }
 
 # ---------------------------------------------------------------- server
 cmd_server() {
   need_root
-  local proto="" remove=0 port=""
+  local proto="" remove=0 port="" sni=""
   while [ $# -gt 0 ]; do case "$1" in
-    --proto) proto=$2; shift 2 ;; --remove) remove=1; shift ;; --port) port=$2; shift 2 ;;
+    --proto) proto=$2; shift 2 ;; --remove) remove=1; shift ;; --port) port=$2; shift 2 ;; --sni) sni=$2; shift 2 ;;
     *) die "unknown option $1" ;; esac; done
-  case "$proto" in
-    awg3) ;;
-    sstp|vless) die "protocol '$proto' is planned but not shipped yet" ;;
-    *) die "--proto awg3 is required" ;;
-  esac
+  [ -n "${IMAGE_OF[$proto]:-}" ] || die "--proto awg3|sstp|vless is required"
   sync_code
+  install_vpnctl
   if [ "$remove" = 1 ]; then
-    "$PREFIX/server/install-awg3.sh" --remove
+    vpnctl uninstall "$proto"
     return
   fi
   command -v docker >/dev/null || { say "installing docker"; apt-get update -qq && apt-get install -y -qq docker.io >/dev/null; }
-  if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-    if docker pull -q "$GHCR_IMAGE" >/dev/null 2>&1; then
-      docker tag "$GHCR_IMAGE" "$IMAGE"
+  local image=${IMAGE_OF[$proto]} name=${IMAGE_OF[$proto]%%:*}
+  if ! docker image inspect "$image" >/dev/null 2>&1; then
+    if docker pull -q "$GHCR/$image" >/dev/null 2>&1; then
+      docker tag "$GHCR/$image" "$image"
     else
-      say "no prebuilt image reachable, building locally (needs ~1 GB free)"
-      docker build -q -t "$IMAGE" "$PREFIX/images/awg3" >/dev/null
+      say "no prebuilt image reachable, building $name locally (needs ~1 GB free)"
+      docker build -q -t "$image" "$PREFIX/images/$name" >/dev/null
     fi
   fi
-  install_awgctl; install_guard
-  AWG3_IMAGE=$IMAGE "$PREFIX/server/install-awg3.sh" ${port:+--port "$port"}
+  install_guard
+  vpnctl install "$proto" ${port:+--port "$port"} ${sni:+--sni "$sni"}
 }
 
 case "${1:-}" in

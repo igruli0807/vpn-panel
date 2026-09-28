@@ -11,6 +11,15 @@ document.addEventListener("click", function (ev) {
     el.select(); document.execCommand("copy"); done();
   }
 });
+document.addEventListener("click", function (ev) {
+  var b = ev.target.closest("[data-copy-text]");
+  if (!b) return;
+  var el = document.getElementById(b.getAttribute("data-copy-text"));
+  if (!el) return;
+  var t = b.textContent;
+  var done = function () { b.textContent = "скопировано"; setTimeout(function () { b.textContent = t; }, 1500); };
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(el.textContent).then(done); }
+});
 document.addEventListener("submit", function (ev) {
   var msg = ev.target.getAttribute("data-confirm");
   if (msg && !window.confirm(msg)) ev.preventDefault();

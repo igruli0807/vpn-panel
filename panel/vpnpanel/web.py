@@ -9,7 +9,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import access, accounts, auth, clientconf, runner, service, views
+from . import access, accounts, auth, clientconf, delivery, jobs, runner, servers, service, views
 from .accounts import AccountError
 from .service import OpError
 
@@ -23,7 +23,8 @@ _params_lock = threading.Lock()
 
 
 def cached_config(cfg, db, c):
-    """client_config() with container params cached for 5 minutes (saves SSH round trips)."""
+    """clientconf.build() with container params cached for 5 minutes (saves SSH round trips).
+    -> (bundle, kind)."""
     key = (c["server"], c["container"])
     with _params_lock:
         hit = _params_cache.get(key)
@@ -33,11 +34,15 @@ def cached_config(cfg, db, c):
         params = runner.run(cfg, cfg.server(c["server"]), "params", c["container"])
         with _params_lock:
             _params_cache[key] = (time.time(), params)
-    if not c.get("priv"):
+    if not service.has_config(c):
         raise OpError("у клиента нет ключа в панели")
-    s = cfg.server(c["server"])
-    return clientconf.render(params, private_key=c["priv"], address=c["ip"], preshared_key=c["psk"],
-                             endpoint_host=s["endpoint"]), params["kind"]
+    return clientconf.build(params, c, cfg.server(c["server"])["endpoint"]), params["kind"]
+
+
+def forget_params(sid=None):
+    with _params_lock:
+        for k in [k for k in _params_cache if sid is None or k[0] == sid]:
+            _params_cache.pop(k, None)
 
 
 def client_rows(cfg, db, where="1=1", args=()):
@@ -59,6 +64,24 @@ def client_rows(cfg, db, where="1=1", args=()):
     for r in rows:
         r["protected"] = r["pub"] in prot
     return rows
+
+
+def delivery_state(cfg, db, c):
+    token = db.get("tg_token")
+    return {"tg_ready": bool(token), "tg_username": db.get("tg_username") or "", "tg_bound": bool(c.get("tg_chat_id")),
+            "smtp_ready": delivery.smtp_ready(db)}
+
+
+def protected_units(cfg, db):
+    """{server: {container}} of units that carry a protected peer (the admin's own tunnel): never uninstall these."""
+    prot = list(cfg.get("protected_pubkeys") or [])
+    if not prot:
+        return {}
+    rows = db.q(f"SELECT DISTINCT server, container FROM clients WHERE pub IN ({','.join('?' * len(prot))})", prot)
+    out = {}
+    for r in rows:
+        out.setdefault(r["server"], set()).add(r["container"])
+    return out
 
 
 def selfsigned_url(cfg):
@@ -186,6 +209,24 @@ def make_handler(app):
                 m = re.fullmatch(r"/client/(\d+)", path)
                 if m:
                     return self.client(me, int(m.group(1)), notice=self.notice(qs))
+                m = re.fullmatch(r"/jobs/(\d+)", path)
+                if m and access.is_owner(me):
+                    job = db.one("SELECT * FROM jobs WHERE id=?", (int(m.group(1)),))
+                    if not job:
+                        return self.nf(me)
+                    title = next((x["title"] for x in cfg["servers"] if x["id"] == job["server"]), job["server"] or "")
+                    return self.send(200, views.job_page(me, fmt, job, title))
+                if path.startswith("/servers") and access.is_owner(me):
+                    if path == "/servers":
+                        return self.servers_view(me, notice=self.notice(qs))
+                    if path == "/servers/new":
+                        return self.send(200, views.server_form_page(me))
+                    m = re.fullmatch(r"/servers/([a-z0-9-]+)/update", path)
+                    if m:
+                        s_ = next((x for x in cfg["servers"] if x["id"] == m.group(1) and x.get("transport") == "ssh"), None)
+                        return self.send(200, views.server_form_page(me, s_)) if s_ else self.nf(me)
+                if path == "/settings" and access.is_owner(me):
+                    return self.settings_view(me)
                 if path.startswith("/users"):
                     if not access.is_owner(me):
                         return self.nf(me)
@@ -225,6 +266,13 @@ def make_handler(app):
                 m = re.fullmatch(r"/client/(\d+)/(disable|enable|delete|rename|share|migrate)", path)
                 if m:
                     return self.action(me, int(m.group(1)), m.group(2), f)
+                m = re.fullmatch(r"/client/(\d+)/(tg-link|tg-send|email)", path)
+                if m:
+                    return self.deliver(me, int(m.group(1)), m.group(2), f)
+                if path.startswith("/servers") and access.is_owner(me):
+                    return self.servers_post(me, path, f)
+                if path.startswith("/settings/") and access.is_owner(me):
+                    return self.settings_post(me, path[len("/settings/"):], f)
                 m = re.fullmatch(r"/share/(\d+)/revoke", path)
                 if m:
                     return self.revoke(me, int(m.group(1)))
@@ -284,7 +332,8 @@ def make_handler(app):
 
         @staticmethod
         def notice(qs):
-            return {"created": "Клиент создан. Покажите QR-код или создайте ссылку."}.get(qs.get("ok", ""), "")
+            return {"created": "Клиент создан. Покажите QR-код, создайте ссылку или отправьте в Telegram / на почту.",
+                    "removed": "Сервер убран из панели."}.get(qs.get("ok", ""), "")
 
         def dashboard(self, me, qs):
             filters = {k: (qs.get(k) or "").strip()[:64] for k in ("server", "container", "status", "q")}
@@ -316,17 +365,17 @@ def make_handler(app):
                                            db.q(f"SELECT * FROM server_health WHERE {sh_where}", sh_args),
                                            rows, filters, now))
 
-        def client(self, me, cid, error="", new_link="", notice=""):
+        def client(self, me, cid, error="", new_link="", notice="", tg_link=""):
             c = self.own_client(me, cid)
             if not c:
                 return self.nf(me, "Нет такого клиента.")
             server = cfg.server(c["server"])
-            conf = qr = None
+            bundle = qr = None
             kind = c["kind"]
-            if c.get("priv") and not c["deleted"]:
+            if service.has_config(c) and not c["deleted"]:
                 try:
-                    conf, kind = cached_config(cfg, db, c)
-                    qr = clientconf.qr_svg(conf)
+                    bundle, kind = cached_config(cfg, db, c)
+                    qr = clientconf.qr_svg(bundle["qr"]) if bundle["qr"] else None
                 except (OpError, runner.CtlError) as ex:
                     error = error or f"Конфиг не собрать: {ex}"
             shares = db.q("SELECT * FROM shares WHERE client_id=? ORDER BY id DESC LIMIT 20", (cid,))
@@ -337,15 +386,16 @@ def make_handler(app):
             targets = [{"server": h["server"], "container": h["container"],
                         "title": f"{titles.get(h['server'], h['server'])} — AWG 3.1 (UDP {h['port']})"}
                        for h in visible_health(me) if h["kind"] == "awg3" and h["up"]]
-            self.send(200, views.client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets,
-                                             c["protected"], error, new_link, notice, selfsigned_url(cfg)))
+            send_html = views.send_block(me, c, delivery_state(cfg, db, c), tg_link) if bundle else ""
+            self.send(200, views.client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets,
+                                             c["protected"], error, new_link, notice, selfsigned_url(cfg), send_html))
 
         def create(self, me, f):
             try:
                 sid, container = (f.get("target") or "|").split("|", 1)
                 if not access.can(cfg, me, sid):
                     raise OpError("нет доступа к этому серверу")
-                cid = service.create_client(cfg, db, sid, container, f.get("name"))
+                cid = service.create_client(cfg, db, sid, container, f.get("name"), login=f.get("login"))
                 db.x("UPDATE clients SET created_by=? WHERE id=?", (me["user_id"], cid))
             except (OpError, runner.CtlError, ValueError) as ex:
                 return self.send(400, views.new_page(me, visible_servers(me), visible_health(me), str(ex)))
@@ -401,12 +451,177 @@ def make_handler(app):
             if not c:
                 return self.send(404, views.link_invalid())
             try:
-                conf, kind = cached_config(cfg, db, c)
+                bundle, kind = cached_config(cfg, db, c)
             except (OpError, runner.CtlError):
                 return self.send(503, views.server_down())
             db.event(f"открыта ссылка клиента «{c['name']}»", self.ip, None, c["server"])
-            self.send(200, views.share_page(c, conf, kind, clientconf.qr_svg(conf),
-                                            clientconf.platform_of(self.headers.get("User-Agent"))))
+            qr = clientconf.qr_svg(bundle["qr"]) if bundle["qr"] else None
+            self.send(200, views.share_page(c, bundle, kind, qr, clientconf.platform_of(self.headers.get("User-Agent"))))
+
+        # ---- delivery ----
+        def deliver(self, me, cid, act, f):
+            c = self.own_client(me, cid)
+            if not c:
+                return self.nf(me, "Нет такого клиента.")
+            try:
+                if act == "tg-link":
+                    link = delivery.tg_link(db, cid)
+                    self.event(me, f"ссылка на Telegram-бота для «{c['name']}»", c["server"])
+                    return self.client(me, cid, tg_link=link)
+                if act == "tg-send":
+                    if not c.get("tg_chat_id"):
+                        raise delivery.DeliveryError("человек ещё не открывал бота — сначала отправьте ему ссылку на бота")
+                    delivery.tg_send_client(cfg, db, c, c["tg_chat_id"])
+                    self.event(me, f"конфиг «{c['name']}» отправлен в Telegram", c["server"])
+                    return self.client(me, cid, notice="Отправлено в Telegram.")
+                if act == "email":
+                    to = (f.get("email") or "").strip()
+                    delivery.mail_client(cfg, db, c, to)
+                    self.event(me, f"конфиг «{c['name']}» отправлен на {to}", c["server"])
+                    return self.client(me, cid, notice=f"Письмо отправлено на {to}.")
+            except (delivery.DeliveryError, OpError, runner.CtlError) as ex:
+                return self.client(me, cid, error=str(ex))
+            self.nf(me)
+
+        # ---- settings (owner) ----
+        def settings_view(self, me, error="", ok=""):
+            token = db.get("tg_token")
+            st = {"tg_ready": bool(token), "tg_username": db.get("tg_username") or "", "tg_masked": delivery.mask(token)}
+            self.send(400 if error else 200, views.settings_page(me, st, delivery.smtp_settings(db), error, ok))
+
+        def settings_post(self, me, what, f):
+            try:
+                if what == "telegram":
+                    username = delivery.tg_save(db, f.get("tg_token"))
+                    self.event(me, "Telegram-бот " + (f"@{username} подключён" if username else "отключён"))
+                    return self.settings_view(me, ok=(f"Бот @{username} подключён." if username else "Бот отключён."))
+                if what == "smtp":
+                    delivery.smtp_save(db, f)
+                    self.event(me, "изменены настройки почты")
+                    to = (f.get("test_to") or "").strip()
+                    if to:
+                        delivery.send_mail(db, to, "VPN-панель: проверка почты", "Если вы это читаете — почта настроена.")
+                        return self.settings_view(me, ok=f"Сохранено. Тестовое письмо отправлено на {to}.")
+                    return self.settings_view(me, ok="Сохранено.")
+            except delivery.DeliveryError as ex:
+                return self.settings_view(me, error=str(ex))
+            self.nf(me)
+
+        # ---- servers (owner) ----
+        def servers_view(self, me, error="", ok="", notice=""):
+            running = {r["server"]: r["id"] for r in db.q("SELECT server, id FROM jobs WHERE status='running'")}
+            self.send(400 if error else 200, views.servers_page(
+                me, fmt, cfg["servers"], db.q("SELECT * FROM health ORDER BY server, container"),
+                db.q("SELECT * FROM server_health"), running, protected_units(cfg, db), error, ok or notice))
+
+        def admin_from_form(self, f, host=None, port=None):
+            host = (host or f.get("host") or "").strip()
+            if not servers.HOST_RE.match(host):
+                raise servers.ServerError("неверный SSH-адрес")
+            if not (f.get("password") or f.get("key", "").strip()):
+                raise servers.ServerError("нужен пароль root или приватный ключ")
+            return servers.Admin(cfg, host, port or f.get("port") or 22, (f.get("user") or "root").strip(),
+                                 password=f.get("password") or None, key_text=f.get("key") or None)
+
+        def servers_post(self, me, path, f):
+            if path == "/servers/new":
+                try:
+                    admin = self.admin_from_form(f)
+                except servers.ServerError as ex:
+                    return self.send(400, views.server_form_page(me, error=str(ex)))
+                title = (f.get("title") or "").strip()[:40] or admin.host
+                endpoint = (f.get("endpoint") or "").strip() or admin.host
+                sid = servers.new_id(db, title)
+
+                def work(log):
+                    try:
+                        server, info = servers.bootstrap(cfg, db, admin, sid, title, endpoint, log)
+                    finally:
+                        admin.close()
+                    servers.save(db, server, info)
+                    servers.refresh(cfg, db)
+                    from . import poller
+                    poller.poll_server(cfg, db, cfg.server(sid))
+                    log(f"сервер «{title}» добавлен в панель")
+                    return {"server": sid}
+                jid = jobs.start(db, sid, f"Подключение сервера «{title}»", work, me["user_id"])
+                self.event(me, f"подключение сервера «{title}» ({admin.host})", sid)
+                return self.redirect(f"/jobs/{jid}")
+            m = re.fullmatch(r"/servers/([a-z0-9-]+)/(install|uninstall|check|update|remove)", path)
+            if not m:
+                return self.nf(me)
+            sid, act = m.group(1), m.group(2)
+            try:
+                srv = cfg.server(sid)
+            except KeyError:
+                return self.nf(me, "Нет такого сервера.")
+            try:
+                if act == "check":
+                    info = runner.run(cfg, srv, "preflight", timeout=60)
+                    servers.set_info(db, sid, info)
+                    servers.refresh(cfg, db)
+                    from . import poller
+                    poller.poll_server(cfg, db, srv)
+                    return self.servers_view(me, ok=f"«{srv['title']}» на связи: vpnctl {info.get('version')}, свободно {info.get('free_mb')} МБ.")
+                if act == "remove":
+                    note = servers.remove(cfg, db, sid)
+                    forget_params(sid)
+                    self.event(me, f"сервер «{srv['title']}» убран из панели{note}")
+                    return self.servers_view(me, ok=f"Сервер «{srv['title']}» убран из панели.{note}")
+                if act == "update":
+                    admin = self.admin_from_form(f, srv.get("ssh_host"), srv.get("ssh_port"))
+
+                    def upd(log):
+                        try:
+                            server, info = servers.bootstrap(cfg, db, admin, sid, srv["title"], srv["endpoint"], log)
+                        finally:
+                            admin.close()
+                        servers.set_info(db, sid, info)
+                        servers.refresh(cfg, db)
+                        return {"server": sid}
+                    jid = jobs.start(db, sid, f"Обновление агента на «{srv['title']}»", upd, me["user_id"])
+                    self.event(me, f"обновление агента на «{srv['title']}»", sid)
+                    return self.redirect(f"/jobs/{jid}")
+                proto = f.get("proto")
+                if proto not in servers.PROTOCOLS:
+                    raise servers.ServerError("нет такого протокола")
+                if act == "install":
+                    args = ["install", proto]
+                    port = (f.get("port") or "").strip()
+                    if port:
+                        if not port.isdigit() or not 1 <= int(port) <= 65535:
+                            raise servers.ServerError("порт — число от 1 до 65535")
+                        args += ["--port", port]
+                    sni = (f.get("sni") or "").strip()
+                    if proto == "vless" and sni:
+                        if not servers.HOST_RE.match(sni):
+                            raise servers.ServerError("неверный SNI")
+                        args += ["--sni", sni]
+                    title = f"Установка {servers.PROTOCOLS[proto]} на «{srv['title']}»"
+                else:
+                    if servers.UNIT_OF[proto] in protected_units(cfg, db).get(sid, set()):
+                        raise servers.ServerError("на этом протоколе служебный туннель администратора — удалять нельзя")
+                    args = ["uninstall", proto]
+                    title = f"Удаление {servers.PROTOCOLS[proto]} с «{srv['title']}»"
+
+                def run_proto(log):
+                    res = runner.stream(cfg, srv, *args, on_line=log)
+                    forget_params(sid)
+                    from . import poller
+                    poller.poll_server(cfg, db, srv)
+                    try:
+                        servers.set_info(db, sid, runner.run(cfg, srv, "preflight", timeout=60))
+                        servers.refresh(cfg, db)
+                    except runner.CtlError:
+                        pass
+                    return res
+                jid = jobs.start(db, sid, title, run_proto, me["user_id"])
+                self.event(me, title.lower(), sid)
+                return self.redirect(f"/jobs/{jid}")
+            except (servers.ServerError, runner.CtlError, jobs.Busy) as ex:
+                if act == "update":
+                    return self.send(400, views.server_form_page(me, srv, str(ex)))
+                return self.servers_view(me, error=str(ex))
 
         # ---- journal ----
         def journal(self, me):
@@ -506,6 +721,9 @@ def make_handler(app):
 
 
 def serve(cfg, db):
+    servers.refresh(cfg, db)
+    jobs.reap(db)
+    delivery.start_bot(cfg, db)
     httpd = ThreadingHTTPServer((cfg["listen"], cfg["port"]), make_handler(App(cfg, db)))
     httpd.daemon_threads = True
     if cfg.get("tls_cert"):

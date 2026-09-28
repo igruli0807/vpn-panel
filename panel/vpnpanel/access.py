@@ -24,8 +24,6 @@ def can(cfg, me, sid):
 
 def sql(cfg, me, col="c.server"):
     """-> (where-clause, args) limiting a query to this user's servers."""
-    if is_owner(me):
-        return "1=1", ()
     ids = servers(cfg, me)
     if not ids:
         return "0", ()

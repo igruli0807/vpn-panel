@@ -91,7 +91,7 @@ def layout(title, body, me=None, active="", page_cls="page"):
     if me:
         items = [("/", "Клиенты", "clients"), ("/new", "Добавить", "new"), ("/log", "Журнал", "log")]
         if me["role"] == "owner":
-            items.append(("/users", "Учётки", "users"))
+            items += [("/servers", "Серверы", "servers"), ("/users", "Учётки", "users"), ("/settings", "Настройки", "settings")]
         links = "".join(f'<a class="lnk{" on" if a == active else ""}" href="{h}">{t}</a>' for h, t, a in items)
         mlinks = "".join(f'<a class="{"on" if a == active else ""}" href="{h}">{t}</a>' for h, t, a in items)
         who = e(me["name"] or me["login"])
@@ -201,7 +201,7 @@ def dashboard(me, fmt, servers, health, server_health, clients, filters, now):
         cards.append(f"""<a class="{cls}" href="/?server={e(h['server'])}&amp;container={e(h['container'])}">
 <div class="top"><span class="small muted">{e(titles.get(h['server'], h['server']))}</span>{badge(h['kind'])}</div>
 <div class="big">{on} <small>в сети из {h['peers']}</small></div>
-<div class="top"><span class="mono muted">UDP {e(h['port'])}</span><span class="st">{state}</span></div></a>""")
+<div class="top"><span class="mono muted">{"TCP" if h["kind"] in ("sstp", "vless") else "UDP"} {e(h['port'])}</span><span class="st">{state}</span></div></a>""")
     sopt = '<option value="">Все серверы</option>' + "".join(
         f'<option value="{e(s["id"])}"{" selected" if filters["server"] == s["id"] else ""}>{e(s.get("title", s["id"]))}</option>'
         for s in servers)
@@ -251,10 +251,13 @@ def dashboard(me, fmt, servers, health, server_health, clients, filters, now):
 def new_page(me, servers, health, error=""):
     titles = {s["id"]: s.get("title", s["id"]) for s in servers}
     opts = []
-    for h in sorted(health, key=lambda h: (h["kind"] != "awg3", h["server"])):
+    order = {"awg3": 0, "vless": 1, "awg2": 2, "sstp": 3}
+    for h in sorted(health, key=lambda h: (order.get(h["kind"], 9), h["server"])):
         if h["kind"] in CAN_ADD and h["server"] in titles:
+            proto = "TCP" if h["kind"] in ("sstp", "vless") else "UDP"
+            label = " (системный)" if h["container"] == "sstp-host" else ""
             opts.append(f'<option value="{e(h["server"])}|{e(h["container"])}">'
-                        f'{e(titles[h["server"]])} — {e(KIND_TITLE[h["kind"]])} (UDP {e(h["port"])})</option>')
+                        f'{e(titles[h["server"]])} — {e(KIND_TITLE[h["kind"]])}{label} ({proto} {e(h["port"])})</option>')
     err = alert("Не удалось создать клиента", error) if error else ""
     select = (f'<select name="target" class="in tall" aria-label="Сервер и протокол">{"".join(opts)}</select>' if opts else
               '<p class="hint">Нет доступных контейнеров для новых клиентов.</p>')
@@ -265,7 +268,11 @@ def new_page(me, servers, health, error=""):
 <input id="nm" name="name" class="in tall" maxlength="64" placeholder="Иван, телефон" required>
 <span class="hint">До 64 символов. Видно только в панели.</span></div>
 <fieldset class="field"><legend class="lb">Сервер и протокол</legend>{select}
-<span class="hint">AWG 3.1 — для Amnezia VPN 5.0.1.5+ и AmneziaWG 3.1. AWG 2.0 — для тех, у кого приложение старое.</span></fieldset>
+<span class="hint">AWG 3.1 — для Amnezia VPN 5.0.1.5+ и AmneziaWG 3.1; AWG 2.0 — для старых приложений.
+VLESS — клиенты Xray (v2rayNG, Hiddify, Streisand). SSTP — встроенный VPN Windows и MikroTik.</span></fieldset>
+<div class="field"><label class="lb" for="lgn">Логин для SSTP <span class="muted">(необязательно)</span></label>
+<input id="lgn" name="login" class="in tall" maxlength="32" autocapitalize="none" placeholder="придумается сам">
+<span class="hint">Только для SSTP: латиница, цифры, точка, дефис. Пароль панель сгенерирует.</span></div>
 <button class="btn pri tall" type="submit"{'' if opts else ' disabled'}>Создать</button>
 <span class="hint">После создания сразу откроется карточка с QR-кодом.</span>
 </div></form>"""
@@ -297,8 +304,9 @@ def chart(points, fmt):
             f'<div class="axis">{days}</div>'), fmt.size(top) if any(buckets) else None
 
 
-def client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets, protected,
-                error="", new_link="", notice="", selfsigned=True):
+def client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets, protected,
+                error="", new_link="", notice="", selfsigned=True, send_html=""):
+    conf = bundle["text"] if bundle else None
     now = int(time.time())
     title = c["name"] or "(без имени)"
     dot, st = _row_state(c, now)
@@ -331,7 +339,7 @@ def client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets, pro
         tgl = "enable" if c["disabled"] else "disable"
         acts.append(f"""<div class="split"><div><div class="lb">Доступ</div><div class="hint">Отключённый клиент хранится, но не подключается.</div></div>
 <form method="post" action="/client/{c['id']}/{tgl}">{csrf_field(me)}<button class="btn" type="submit">{'Включить' if c['disabled'] else 'Отключить'}</button></form></div>""")
-        if targets and kind != "awg3" and not c["migrated_to"] and conf:
+        if targets and kind in ("awg2", "legacy", "wireguard") and not c["migrated_to"] and conf:
             acts.append(_migrate_form(me, c, targets))
         acts.append(f"""<div class="split top"><div><div class="lb danger">Удалить клиента</div><div class="hint">Его VPN перестанет работать сразу.</div></div>
 <form method="post" action="/client/{c['id']}/delete" data-confirm="Удалить клиента «{e(title)}»? Его VPN перестанет работать.">
@@ -339,19 +347,14 @@ def client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets, pro
     actions = f'<section class="panel"><div class="ph"><h2>Действия</h2></div><div class="pb">{"".join(acts)}</div></section>' if acts else ""
 
     side = []
-    if conf:
-        b64 = base64.b64encode(conf.encode()).decode()
-        fname = e(_fname(c["name"]))
-        side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div><div class="pb qrwrap">
-<div class="qr" role="img" aria-label="QR-код конфигурации">{qr}</div>
-<p class="hint c">Сканируйте в {e(_app(kind))}: «+» → «QR-код».</p>
-<div class="row wrap"><a class="btn pri" download="{fname}.conf" href="data:text/plain;base64,{b64}">Скачать .conf</a>
-<button class="btn" type="button" data-copy="conf">Копировать текст</button></div>
-<textarea id="conf" readonly class="hidden-ta" tabindex="-1" aria-hidden="true">{e(conf)}</textarea></div>
+    if bundle:
+        side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div>{config_block(bundle, kind, qr, c)}
 <div class="pb apps-pb"><div class="lb">Приложения для клиента</div>{apps_block(kind, "android", compact=True)}</div></section>""")
+        if send_html:
+            side.append(send_html)
         side.append(_share_block(me, fmt, c, shares, new_link, now, selfsigned))
     elif not c["deleted"] and not protected:
-        mig = _migrate_form(me, c, targets) if targets and not c["migrated_to"] else ""
+        mig = _migrate_form(me, c, targets) if targets and not c["migrated_to"] and kind in ("awg2", "legacy", "wireguard") else ""
         side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div><div class="pb">
 <p class="muted">Клиент создан в приложении Amnezia — его ключа в панели нет. Выдайте ему новый конфиг через «Перевести на AWG 3.1».</p>{mig}</div></section>""")
     body = f"""<div class="head"><a class="btn txt back" href="/">← все клиенты</a>
@@ -433,19 +436,57 @@ def apps_block(kind, first="desktop", compact=False):
 
 # ---------- public pages ----------
 
-def share_page(c, conf, kind, qr, platform="desktop"):
-    b64 = base64.b64encode(conf.encode()).decode()
+def _data_url(text, mime="text/plain"):
+    return f"data:{mime};base64," + base64.b64encode(text.encode()).decode()
+
+
+def config_block(b, kind, qr, c, public=False):
+    """What the client receives, per protocol (admin card and public page share it)."""
+    big = " xl full" if public else ""
+    parts = []
+    if qr:
+        parts.append(f'<div class="qr" role="img" aria-label="QR-код для подключения">{qr}</div>')
+    if b["kind"] == "sstp":
+        rows = "".join(
+            f'<div class="kv"><span class="k">{e(k)}</span><span class="v mono" id="f{i}">{e(v)}</span>'
+            f'<button class="btn txt" type="button" data-copy-text="f{i}">копировать</button></div>'
+            for i, (k, v) in enumerate(b["fields"]))
+        parts.append(f'<div class="kvs">{rows}</div>')
+        steps = ('<p class="hint">Windows: «Параметры → Сеть → VPN → Добавить»: тип «SSTP», сервер и логин/пароль отсюда. '
+                 'Android — Open SSTP Client, MikroTik — /interface sstp-client.</p>')
+        if b.get("cert_pem"):
+            steps += ('<p class="hint">Сертификат сервера самоподписанный: на Windows его нужно один раз установить в '
+                      '«Доверенные корневые центры сертификации» (двойной щелчок по файлу → «Установить сертификат»). '
+                      'В Android-клиенте включите «не проверять сертификат» или импортируйте его.</p>')
+        parts.append(steps)
+        btns = [f'<button class="btn{" pri" if not b.get("cert_pem") else ""}{big}" type="button" data-copy="conf">Копировать всё</button>']
+        if b.get("cert_pem"):
+            btns.insert(0, f'<a class="btn pri{big}" download="{e(b["cert_name"])}" href="{_data_url(b["cert_pem"], "application/x-x509-ca-cert")}">Скачать сертификат</a>')
+    elif b["kind"] == "vless":
+        parts.append(f'<p class="hint c">Отсканируйте QR или скопируйте ссылку и вставьте в приложение («+» → «Импорт из буфера»).</p>')
+        parts.append(f'<div class="uri mono">{e(b["text"])}</div>')
+        btns = [f'<button class="btn pri{big}" type="button" data-copy="conf">Копировать ссылку</button>']
+    else:
+        parts.append(f'<p class="hint c">Сканируйте в {e(_app(kind))}: «+» → «QR-код».</p>')
+        btns = [f'<a class="btn pri{big}" download="{e(b["filename"])}" href="{_data_url(b["text"])}">Скачать {"файл конфигурации" if public else ".conf"}</a>',
+                f'<button class="btn{big if public else ""}" type="button" data-copy="conf">Копировать текст</button>']
+    wrap = "soft" if public else "pb qrwrap"
+    return (f'<div class="{wrap}">{"".join(parts)}<div class="row wrap{" col-btns" if public else ""}">{"".join(btns)}</div>'
+            f'<textarea id="conf" readonly class="hidden-ta" tabindex="-1" aria-hidden="true">{e(b["text"])}</textarea></div>')
+
+
+def share_page(c, b, kind, qr, platform="desktop"):
+    step2 = {"sstp": "Создайте VPN-подключение типа SSTP с данными ниже.",
+             "vless": "В приложении нажмите «+» и выберите «Сканировать QR» или «Импорт из буфера».",
+             }.get(b["kind"], "В приложении нажмите «+» и выберите «QR-код» или «Файл».")
     return bare("Ваш VPN", f"""<div class="pubwrap"><main class="pub">
 <div class="head"><h1>Ваш VPN</h1><p class="muted">Подключение для: <strong>{e(c['name'])}</strong></p></div>
 <ol class="steps">
 <li><span class="n">1</span><div class="grow">Установите приложение — ссылки для вашего устройства первыми:{apps_block(kind, platform)}</div></li>
-<li><span class="n">2</span><div>В приложении нажмите «+» и выберите «QR-код» или «Файл».</div></li>
+<li><span class="n">2</span><div>{e(step2)}</div></li>
 <li><span class="n">3</span><div>Включите подключение.</div></li></ol>
-<div class="soft"><div class="qr" role="img" aria-label="QR-код для подключения">{qr}</div>
-<a class="btn pri xl full" download="{e(_fname(c['name']))}.conf" href="data:text/plain;base64,{b64}">Скачать файл конфигурации</a>
-<button class="btn lg full" type="button" data-copy="conf">Копировать текст</button>
-<textarea id="conf" readonly class="hidden-ta" tabindex="-1" aria-hidden="true">{e(conf)}</textarea></div>
-<p class="small muted">Это ваш личный ключ — не пересылайте его. Ссылка может быть одноразовой: сохраните файл сейчас.</p>
+{config_block(b, kind, qr, c, public=True)}
+<p class="small muted">Это ваши личные данные для входа — не пересылайте их. Ссылка может быть одноразовой: сохраните всё сейчас.</p>
 </main></div>""")
 
 
@@ -613,3 +654,162 @@ def _app(kind):
 def _fname(name):
     keep = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (name or "vpn"))
     return (keep.strip("_") or "vpn")[:40]
+
+
+# ---------- sending a config to the client ----------
+
+def send_block(me, c, st, tg_link=""):
+    parts = []
+    if st["tg_ready"]:
+        link = ""
+        if tg_link:
+            link = f"""<div class="linkbox"><div class="row between"><span class="lt">Ссылка на бота</span><span class="small muted">72 часа, один раз</span></div>
+<div class="row"><input id="tglink" class="in mono grow" value="{e(tg_link)}" readonly aria-label="Ссылка на бота">
+<button class="btn" type="button" data-copy="tglink">Копировать</button></div>
+<p class="note">{I_INFO}Перешлите её человеку. Он нажмёт «Start» — и бот пришлёт ему всё для подключения.</p></div>"""
+        now_btn = (f"""<form method="post" action="/client/{c['id']}/tg-send">{csrf_field(me)}<button class="btn" type="submit">Отправить снова в Telegram</button></form>"""
+                   if st["tg_bound"] else "")
+        parts.append(f"""<div class="field"><span class="lb">Telegram — бот @{e(st['tg_username'])}</span>
+<div class="row wrap"><form method="post" action="/client/{c['id']}/tg-link">{csrf_field(me)}<button class="btn pri" type="submit">Ссылка на бота</button></form>{now_btn}</div>
+{('<span class="hint">Человек уже подключил бота — можно отправлять сразу.</span>' if st['tg_bound'] else '')}{link}</div>""")
+    else:
+        parts.append('<p class="hint">Telegram не настроен' + (' — «Настройки» → Telegram.' if me["role"] == "owner" else '.') + '</p>')
+    if st["smtp_ready"]:
+        parts.append(f"""<form class="field" method="post" action="/client/{c['id']}/email">{csrf_field(me)}
+<label class="lb" for="em">Почта</label><div class="row"><input id="em" name="email" type="email" class="in grow" value="{e(c.get('email') or '')}" placeholder="name@example.com" required>
+<button class="btn" type="submit">Отправить</button></div></form>""")
+    else:
+        parts.append('<p class="hint">Почта не настроена' + (' — «Настройки» → Почта.' if me["role"] == "owner" else '.') + '</p>')
+    return f'<section class="panel"><div class="ph"><h2>Отправить клиенту</h2></div><div class="pb">{"".join(parts)}</div></section>'
+
+
+# ---------- settings (owner) ----------
+
+def settings_page(me, st, smtp, error="", ok=""):
+    msgs = (alert(ok, ok=True) if ok else "") + (alert(error) if error else "")
+    sec = "".join(f'<option value="{v}"{" selected" if (smtp.get("smtp_security") or "starttls") == v else ""}>{t}</option>'
+                  for v, t in (("starttls", "STARTTLS (587)"), ("ssl", "SSL/TLS (465)"), ("none", "без шифрования")))
+    tg_state = (f'<p class="hint">Подключён бот <b>@{e(st["tg_username"])}</b> (токен {e(st["tg_masked"])}).</p>' if st["tg_ready"]
+                else '<p class="hint">Создайте бота у @BotFather («/newbot») и вставьте его токен.</p>')
+    body = f"""<div class="head"><h1>Настройки</h1></div>{msgs}
+<div class="grid2"><div class="col">
+<form class="panel" method="post" action="/settings/telegram">{csrf_field(me)}
+<div class="ph"><h2>Telegram</h2></div><div class="pb">{tg_state}
+<div class="field"><label class="lb" for="tgt">Токен бота</label><input id="tgt" name="tg_token" class="in tall mono" autocomplete="off" placeholder="123456:ABC…">
+<span class="hint">Пустое поле + «Сохранить» — отключить бота. Токен хранится в базе панели и целиком больше не показывается.</span></div>
+<button class="btn pri tall" type="submit">Проверить и сохранить</button></div></form>
+</div><div class="col">
+<form class="panel" method="post" action="/settings/smtp">{csrf_field(me)}
+<div class="ph"><h2>Почта (SMTP)</h2></div><div class="pb">
+<div class="row wrap"><div class="field grow"><label class="lb" for="sh">Сервер</label><input id="sh" name="smtp_host" class="in tall" value="{e(smtp.get('smtp_host'))}" placeholder="smtp.example.com"></div>
+<div class="field"><label class="lb" for="sp">Порт</label><input id="sp" name="smtp_port" class="in tall" value="{e(smtp.get('smtp_port'))}" placeholder="587" inputmode="numeric"></div></div>
+<div class="field"><label class="lb" for="ss">Шифрование</label><select id="ss" name="smtp_security" class="in tall">{sec}</select></div>
+<div class="field"><label class="lb" for="su">Логин</label><input id="su" name="smtp_user" class="in tall" value="{e(smtp.get('smtp_user'))}" autocomplete="off"></div>
+<div class="field"><label class="lb" for="spw">Пароль</label><input id="spw" name="smtp_pass" type="password" class="in tall" autocomplete="new-password" placeholder="{'сохранён — оставьте пустым, чтобы не менять' if smtp.get('smtp_pass') else ''}"></div>
+<div class="field"><label class="lb" for="sf">Отправитель</label><input id="sf" name="smtp_from" class="in tall" value="{e(smtp.get('smtp_from'))}" placeholder="VPN &lt;vpn@example.com&gt;"></div>
+<div class="field"><label class="lb" for="stt">Тестовое письмо на адрес <span class="muted">(необязательно)</span></label><input id="stt" name="test_to" type="email" class="in tall"></div>
+<button class="btn pri tall" type="submit">Сохранить</button></div></form>
+</div></div>"""
+    return layout("Настройки", body, me, "settings")
+
+
+# ---------- servers (owner) ----------
+
+PROTO_TITLE = {"awg3": "AWG 3.1", "sstp": "SSTP", "vless": "VLESS"}
+UNIT_PROTO = {"awg3": "awg3", "sstp": "sstp", "xray": "vless"}
+
+
+def servers_page(me, fmt, servers, health, server_health, jobs_running, protected_units, error="", ok=""):
+    msgs = (alert(ok, ok=True) if ok else "") + (alert(error) if error else "")
+    sh = {x["server"]: x for x in server_health}
+    cards = []
+    for s in servers:
+        units = [h for h in health if h["server"] == s["id"]]
+        info = s.get("info") or {}
+        st = sh.get(s["id"])
+        state = ('<span class="tag red">не отвечает</span>' if st and not st["ok"] else
+                 '<span class="tag acc">на связи</span>' if st else '<span class="tag">ещё не опрошен</span>')
+        rows = []
+        for h in units:
+            proto = UNIT_PROTO.get(h["container"])
+            rm = ""
+            if proto and h["container"] not in protected_units.get(s["id"], set()):
+                rm = (f'<form method="post" action="/servers/{e(s["id"])}/uninstall" data-confirm="Удалить {e(PROTO_TITLE[proto])} с сервера «{e(s["title"])}»? '
+                      f'Все его клиенты перестанут подключаться. Ключи сохранятся на сервере в стороне.">{csrf_field(me)}'
+                      f'<input type="hidden" name="proto" value="{proto}"><button class="btn txt" type="submit">удалить</button></form>')
+            elif proto:
+                rm = '<span class="small muted">служебный туннель — удалять нельзя</span>'
+            label = " (системный accel-ppp)" if h["container"] == "sstp-host" else ""
+            rows.append(f"""<tr><td>{badge(h['kind'])}{e(label)}</td><td class="mono">{e(h['container'])}</td>
+<td class="mono">{"TCP" if h["kind"] in ("sstp", "vless") else "UDP"} {e(h['port'])}</td>
+<td>{'<span class="tag acc">работает</span>' if h['up'] else '<span class="tag red">не поднят</span>'}</td><td class="r">{h['peers']}</td><td class="r">{rm}</td></tr>""")
+        installed = {UNIT_PROTO.get(h["container"]) for h in units}
+        running = jobs_running.get(s["id"])
+        installs = []
+        if running:
+            installs.append(f'<p class="hint">Идёт задача — <a href="/jobs/{running}">журнал</a>.</p>')
+        else:
+            for proto, title in PROTO_TITLE.items():
+                if proto in installed:
+                    continue
+                sni = ('<input name="sni" class="in" placeholder="SNI (авто)" aria-label="SNI для REALITY">' if proto == "vless" else "")
+                installs.append(f"""<form class="row wrap" method="post" action="/servers/{e(s['id'])}/install">{csrf_field(me)}
+<input type="hidden" name="proto" value="{proto}"><input name="port" class="in port" placeholder="порт (авто)" inputmode="numeric" aria-label="Порт">{sni}
+<button class="btn" type="submit">Установить {e(title)}</button></form>""")
+        facts = []
+        if info:
+            facts.append(f"vpnctl {e(info.get('version', '?'))} · {e(info.get('os', ''))} · свободно {e(info.get('free_mb'))} МБ · памяти {e(info.get('mem_avail_mb'))} МБ"
+                         + ("" if info.get("docker") else " · docker будет установлен"))
+        manage = []
+        if s.get("transport") == "ssh":
+            manage.append(f'<form method="post" action="/servers/{e(s["id"])}/check">{csrf_field(me)}<button class="btn" type="submit">Проверить</button></form>')
+            manage.append(f'<a class="btn" href="/servers/{e(s["id"])}/update">Обновить агент</a>')
+            if s.get("source") != "config":
+                manage.append(f'<form method="post" action="/servers/{e(s["id"])}/remove" data-confirm="Убрать «{e(s["title"])}» из панели? VPN на сервере продолжит работать, '
+                              f'но панель перестанет его видеть и снимет с него свой ключ.">{csrf_field(me)}<button class="btn dng" type="submit">Убрать из панели</button></form>')
+        else:
+            manage.append('<span class="hint">Этот сервер — хост самой панели (управляется локально).</span>')
+        table = (f'<div class="scroll"><table class="t dense"><thead><tr><th>Протокол</th><th>Юнит</th><th>Порт</th><th>Состояние</th>'
+                 f'<th class="r">Клиентов</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>' if rows else
+                 '<p class="empty">Протоколов пока нет.</p>')
+        cards.append(f"""<section class="panel"><div class="ph"><h2>{e(s['title'])}</h2>{state}<span class="sp"></span>
+<span class="mono muted small">{e(s['endpoint'])}{(' · ssh ' + e(s.get('ssh_host')) + ':' + e(s.get('ssh_port'))) if s.get('transport') == 'ssh' else ' · локально'}</span></div>
+{table}<div class="pb">{('<p class="hint">' + ''.join(facts) + '</p>') if facts else ''}
+<div class="lb">Установить протокол</div>{''.join(installs) or '<p class="hint">Все протоколы уже стоят.</p>'}
+<div class="row wrap">{''.join(manage)}</div></div></section>""")
+    body = f"""{msgs}<div class="row between"><h1>Серверы</h1><a class="btn pri" href="/servers/new">+ Добавить сервер</a></div>
+{''.join(cards)}"""
+    return layout("Серверы", body, me, "servers")
+
+
+def server_form_page(me, s=None, error=""):
+    new = s is None
+    s = s or {}
+    title = "Новый сервер" if new else f"Обновить агент: {s.get('title')}"
+    ident = ("" if not new else f"""<div class="field"><label class="lb" for="tt">Название</label><input id="tt" name="title" class="in tall" required maxlength="40" placeholder="Нидерланды"></div>
+<div class="field"><label class="lb" for="ep">Адрес для клиентов <span class="muted">(IP или домен)</span></label><input id="ep" name="endpoint" class="in tall" placeholder="как SSH-адрес">
+<span class="hint">Этот адрес попадёт в конфиги клиентов.</span></div>""")
+    body = f"""<div class="head"><a class="btn txt back" href="/servers">← все серверы</a></div>
+<form class="panel narrow" method="post" action="{'/servers/new' if new else '/servers/' + e(s['id']) + '/update'}">{csrf_field(me)}
+<div class="ph"><h2>{e(title)}</h2></div><div class="pb">{alert(error) if error else ''}
+{ident}
+<div class="row wrap"><div class="field grow"><label class="lb" for="hs">SSH-адрес</label><input id="hs" name="host" class="in tall" required value="{e(s.get('ssh_host', ''))}" placeholder="203.0.113.10"></div>
+<div class="field"><label class="lb" for="pt">Порт</label><input id="pt" name="port" class="in tall port" value="{e(s.get('ssh_port', 22))}" inputmode="numeric"></div></div>
+<div class="field"><label class="lb" for="us">Пользователь</label><input id="us" name="user" class="in tall" value="root"></div>
+<div class="field"><label class="lb" for="pw">Пароль root</label><input id="pw" name="password" type="password" class="in tall" autocomplete="off"></div>
+<div class="field"><label class="lb" for="pk">…или приватный ключ</label><textarea id="pk" name="key" class="in ta mono" rows="4" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"></textarea></div>
+<p class="note">{I_INFO}Пароль или ключ нужен один раз: панель положит на сервер vpnctl и свой ключ, который умеет только управлять VPN. Сами пароль и ключ нигде не сохраняются.</p>
+<button class="btn pri tall" type="submit">{'Подключить' if new else 'Обновить'}</button></div></form>"""
+    return layout(title, body, me, "servers", "page center")
+
+
+def job_page(me, fmt, job, server_title):
+    running = job["status"] == "running"
+    state = {"running": '<span class="tag acc">идёт</span>', "ok": '<span class="tag acc">готово</span>',
+             "failed": '<span class="tag red">ошибка</span>'}[job["status"]]
+    refresh = '<meta http-equiv="refresh" content="3">' if running else ""
+    body = f"""{refresh}<div class="head"><a class="btn txt back" href="/servers">← все серверы</a>
+<div class="row gap12"><h1>{e(job['action'])}</h1>{state}</div><p class="muted">{e(server_title)} · начато {e(fmt.dt(job['started']))}</p></div>
+<section class="panel"><div class="ph"><h2>Журнал</h2>{'<span class="small muted">страница обновляется сама</span>' if running else ''}</div>
+<pre class="log">{e(job['log'])}</pre></section>"""
+    return layout("Задача", body, me, "servers")

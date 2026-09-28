@@ -58,6 +58,19 @@ CREATE TABLE IF NOT EXISTS users (
   disabled INTEGER NOT NULL DEFAULT 0,
   created INTEGER NOT NULL, created_by INTEGER, last_login INTEGER
 );
+CREATE TABLE IF NOT EXISTS servers (
+  id TEXT PRIMARY KEY, title TEXT NOT NULL, endpoint TEXT NOT NULL, transport TEXT NOT NULL,
+  ssh_host TEXT, ssh_port INTEGER, ssh_user TEXT, source TEXT NOT NULL DEFAULT 'panel',
+  info TEXT, created INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  id INTEGER PRIMARY KEY, server TEXT, action TEXT NOT NULL, status TEXT NOT NULL,   -- running | ok | failed
+  log TEXT NOT NULL DEFAULT '', result TEXT, started INTEGER NOT NULL, finished INTEGER, user_id INTEGER
+);
+CREATE TABLE IF NOT EXISTS tg_links (
+  id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+  created INTEGER NOT NULL, expires INTEGER NOT NULL, used_at INTEGER
+);
 CREATE TABLE IF NOT EXISTS invites (
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE,
   created INTEGER NOT NULL, expires INTEGER NOT NULL, used_at INTEGER
@@ -71,6 +84,9 @@ MIGRATIONS = [
     ("events", "user_id", "INTEGER"),
     ("events", "server", "TEXT"),
     ("clients", "created_by", "INTEGER"),
+    ("clients", "secret", "TEXT"),        # SSTP password (the server keeps it in chap-secrets anyway)
+    ("clients", "tg_chat_id", "INTEGER"), # Telegram chat that pressed Start on this client's link
+    ("clients", "email", "TEXT"),         # last address the config was mailed to
 ]
 
 

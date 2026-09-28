@@ -20,7 +20,7 @@ import urllib.parse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(ROOT, "panel"), os.path.join(ROOT, "panel", "vendor")]
 
-from vpnpanel import auth, config, keys, poller, runner, service, web  # noqa: E402
+from vpnpanel import auth, config, delivery, jobs, keys, poller, runner, servers, service, web  # noqa: E402
 from vpnpanel.db import DB  # noqa: E402
 
 AGENT_PUB = keys.pubkey(keys.genkey())
@@ -45,8 +45,22 @@ class FakeCtl:
                                    "endpoint": "1.2.3.4:5555" if v["hs"] else None, "latest_handshake": v["hs"],
                                    "rx": v["rx"], "tx": v["tx"]} for k, v in c["peers"].items()]}
                     for n, c in self.containers.items()}
+        if cmd == "preflight":
+            return {"version": "2.0.0", "os": "Debian 12", "docker": True, "free_mb": 3000, "mem_avail_mb": 400,
+                    "units": list(self.containers)}
+        if cmd == "unlink":
+            self.unlinked = True
+            return {"ok": True, "removed": 1}
         c = self.containers[rest[0]]
         opts = dict(zip(rest[1::2], rest[2::2]))
+        if cmd == "params" and c["kind"] == "sstp":
+            return {"kind": "sstp", "port": c["port"], "cert_pem": "-----BEGIN CERTIFICATE-----\nTEST\n-----END CERTIFICATE-----\n",
+                    "self_signed": True}
+        if cmd == "params" and c["kind"] == "vless":
+            return {"kind": "vless", "port": c["port"], "public_key": "PBKtest", "short_id": "ab12cd34",
+                    "sni": "www.apple.com", "flow": "xtls-rprx-vision", "fp": "chrome"}
+        if cmd == "next-ip" and c["kind"] in ("sstp", "vless"):
+            return {"ip": ""}
         if cmd == "params":
             return {"kind": c["kind"], "server_public_key": AGENT_PUB, "port": c["port"], "subnet": c["subnet"],
                     "shared": {"S1": 20, "S2": 30, "S3": 14, "S4": 16, "H1": "1-2", "H2": "3-4", "H3": "5-6", "H4": "7-8"},
@@ -63,9 +77,9 @@ class FakeCtl:
         if cmd == "add":
             if pub in c["peers"]:
                 return_error("peer already exists")
-            c["peers"][pub] = {"name": opts.get("--name", ""), "ip": opts["--ip"], "disabled": False,
+            c["peers"][pub] = {"name": opts.get("--name", ""), "ip": opts.get("--ip", ""), "disabled": False,
                                "rx": 0, "tx": 0, "hs": 0, "psk": stdin.strip()}
-            return {"ok": True, "ip": opts["--ip"]}
+            return {"ok": True, "ip": opts.get("--ip", "")}
         if pub not in c["peers"]:
             return_error("no such peer")
         if cmd == "remove":
@@ -93,8 +107,14 @@ FAKES = {
             keys.pubkey(keys.genkey()): {"name": "USA client", "ip": "10.8.3.9/32", "disabled": False,
                                          "rx": 0, "tx": 0, "hs": 0},
         }},
+        "sstp": {"kind": "sstp", "port": 45000, "up": True, "subnet": "", "peers": {}},
+        "xray": {"kind": "vless", "port": 46000, "up": True, "subnet": "", "peers": {}},
     }),
+    "nl": FakeCtl({"xray": {"kind": "vless", "port": 47000, "up": True, "subnet": "", "peers": {}}}),
 }
+AGENT3_PUB = keys.pubkey(keys.genkey())
+FAKES["fin"].containers["awg3"]["peers"][AGENT3_PUB] = {"name": "agent awg3", "ip": "10.8.3.250/32", "disabled": False,
+                                                        "rx": 0, "tx": 0, "hs": 0}
 
 
 def fake_run(cfg, server, *args, stdin="", timeout=40):
@@ -110,7 +130,7 @@ class PanelTest(unittest.TestCase):
         cfgfile = f"{cls.tmp}/config.json"
         with open(cfgfile, "w") as fh:
             json.dump({"listen": "127.0.0.1", "port": 0, "db": f"{cls.tmp}/panel.db", "timezone": "Asia/Krasnoyarsk",
-                       "protected_pubkeys": [AGENT_PUB], "public_url": "https://panel.test:2053",
+                       "protected_pubkeys": [AGENT_PUB, AGENT3_PUB], "public_url": "https://panel.test:2053",
                        "servers": [{"id": "fin", "title": "Финляндия", "endpoint": "198.51.100.7", "transport": "local"},
                                    {"id": "usa", "title": "США", "endpoint": "198.51.100.8", "transport": "local"}]}, fh)
         cls.cfg = config.load(cfgfile)
@@ -119,6 +139,7 @@ class PanelTest(unittest.TestCase):
         old.set("admin_password", auth.hash_password(OWNER_PW))
         old.conn.close()
         cls.db = DB(cls.cfg["db"])
+        servers.refresh(cls.cfg, cls.db)
         runner.run = fake_run
         service.runner.run = fake_run
         web.runner.run = fake_run
@@ -386,6 +407,195 @@ class PanelTest(unittest.TestCase):
             self.db.x("INSERT INTO logins(ts, ip, ok, login) VALUES(?,?,0,'victim')", (now - i, f"203.0.113.{i}"))
         self.assertTrue(auth.blocked(self.cfg, self.db, "198.51.100.99", "victim"))
         self.assertFalse(auth.blocked(self.cfg, self.db, "198.51.100.99", "someone"))
+
+    def _new_client(self, token, csrf, name, target, **extra):
+        form = {"csrf": csrf, "name": name, "target": target}
+        form.update(extra)
+        st, h, page = self.req("POST", "/new", form, cookie=token)
+        self.assertEqual(st, 303, page[:500])
+        return int(re.search(r"/client/(\d+)", h["Location"]).group(1))
+
+    def test_30_vless_client(self):
+        token, csrf = self.login()
+        cid = self._new_client(token, csrf, "Мария VLESS", "usa|xray")
+        c = self.db.one("SELECT * FROM clients WHERE id=?", (cid,))
+        self.assertRegex(c["pub"], r"^[0-9a-f-]{36}$")
+        self.assertIn(c["pub"], FAKES["usa"].containers["xray"]["peers"])
+        _, _, page = self.req("GET", f"/client/{cid}", cookie=token)
+        self.assertIn(f"vless://{c['pub']}@198.51.100.8:46000?", page)
+        for part in ("pbk=PBKtest", "sid=ab12cd34", "sni=www.apple.com", "security=reality", "<svg", "Hiddify"):
+            self.assertIn(part, page)
+        _, _, page = self.req("POST", f"/client/{cid}/share", {"csrf": csrf, "hours": "24"}, cookie=token)
+        link = re.search(r'value="https://[^"]+(/s/[A-Za-z0-9_-]+)"', page).group(1)
+        _, _, pub = self.req("GET", link, ua="Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)")
+        self.assertIn("Shadowrocket", pub)
+        self.assertIn("Копировать ссылку", pub)
+
+    def test_31_sstp_client(self):
+        token, csrf = self.login()
+        cid = self._new_client(token, csrf, "Офис Windows", "usa|sstp", login="office.win")
+        c = self.db.one("SELECT * FROM clients WHERE id=?", (cid,))
+        self.assertEqual(c["pub"], "office.win")
+        self.assertEqual(len(c["secret"]), 16)
+        self.assertEqual(FAKES["usa"].containers["sstp"]["peers"]["office.win"]["psk"], c["secret"])
+        _, _, page = self.req("GET", f"/client/{cid}", cookie=token)
+        for part in ("198.51.100.8:45000", "office.win", c["secret"], "Скачать сертификат", "Open SSTP Client"):
+            self.assertIn(part, page)
+        cid2 = self._new_client(token, csrf, "Авто логин", "usa|sstp")
+        self.assertRegex(self.db.one("SELECT pub FROM clients WHERE id=?", (cid2,))["pub"], r"^u[a-z0-9]{7}$")
+
+    def _wait_job(self, jid, token):
+        for _ in range(50):
+            job = self.db.one("SELECT * FROM jobs WHERE id=?", (jid,))
+            if job["status"] != "running":
+                return job
+            time.sleep(0.1)
+        self.fail("job did not finish")
+
+    def test_32_install_job_and_protected_uninstall(self):
+        token, csrf = self.login()
+        _, _, page = self.req("GET", "/servers", cookie=token)
+        self.assertIn("Установить SSTP", page)  # fin has no sstp
+        calls = []
+
+        def fake_stream(cfg, server, *args, on_line=None, timeout=1500):
+            calls.append((server["id"], args))
+            on_line("[vpnctl] pulling image")
+            on_line("[vpnctl] SSTP is running on TCP 51000")
+            return {"ok": True, "unit": "sstp", "port": 51000}
+        orig = runner.stream
+        runner.stream = web.runner.stream = fake_stream
+        try:
+            st, h, _ = self.req("POST", "/servers/fin/install", {"csrf": csrf, "proto": "sstp", "port": "51000"}, cookie=token)
+            self.assertEqual(st, 303)
+            jid = int(h["Location"].rsplit("/", 1)[1])
+            job = self._wait_job(jid, token)
+            self.assertEqual(job["status"], "ok")
+            self.assertEqual(calls[-1], ("fin", ("install", "sstp", "--port", "51000")))
+            _, _, jp = self.req("GET", f"/jobs/{jid}", cookie=token)
+            self.assertIn("SSTP is running on TCP 51000", jp)
+            _, _, page = self.req("POST", "/servers/fin/uninstall", {"csrf": csrf, "proto": "awg3"}, cookie=token)
+            self.assertIn("служебный туннель", page)
+            self.assertNotIn(("fin", ("uninstall", "awg3")), calls)
+            _, _, page = self.req("POST", "/servers/fin/install", {"csrf": csrf, "proto": "vless", "port": "99999"}, cookie=token)
+            self.assertIn("порт", page)
+        finally:
+            runner.stream = web.runner.stream = orig
+
+    def test_33_add_and_remove_server(self):
+        token, csrf = self.login()
+        seen = []
+
+        def fake_admin_run(self_, remote, stdin=None, timeout=120):
+            seen.append((remote, stdin))
+            if remote.startswith("id -u"):
+                return "0 198.51.100.5\n"
+            return ""
+        orig_run, orig_new, orig_pub = servers.Admin.run, servers.new_id, servers.panel_pubkey
+        servers.Admin.run = fake_admin_run
+        servers.new_id = lambda db, title: "nl"
+        servers.panel_pubkey = lambda cfg: "ssh-ed25519 AAAAtest vpn-panel@test"
+        try:
+            st, h, page = self.req("POST", "/servers/new", {"csrf": csrf, "title": "Нидерланды", "host": "203.0.113.20",
+                                                            "port": "22", "user": "root", "password": "x"}, cookie=token)
+            self.assertEqual(st, 303, page[:300])
+            job = self._wait_job(int(h["Location"].rsplit("/", 1)[1]), token)
+            self.assertEqual(job["status"], "ok", job["log"])
+        finally:
+            servers.Admin.run, servers.new_id, servers.panel_pubkey = orig_run, orig_new, orig_pub
+        keyline = next(sd for r, sd in seen if "authorized_keys" in r).decode()
+        self.assertIn('command="/usr/local/sbin/vpnctl --ssh"', keyline)
+        self.assertIn('from="198.51.100.5"', keyline)
+        self.assertIn("no-pty", keyline)
+        self.assertTrue(any(isinstance(sd, bytes) and len(sd) > 1000 for r, sd in seen if "tar -C" in r), "vpnctl bundle uploaded")
+        self.assertIn("nl", [x["id"] for x in self.cfg["servers"]])
+        _, _, page = self.req("GET", "/servers", cookie=token)
+        self.assertIn("Нидерланды", page)
+        _, _, page = self.req("POST", "/servers/nl/remove", {"csrf": csrf}, cookie=token)
+        self.assertIn("убран из панели", page)
+        self.assertTrue(getattr(FAKES["nl"], "unlinked", False), "panel key removed from the server")
+        self.assertNotIn("nl", [x["id"] for x in self.cfg["servers"]])
+        _, _, page = self.req("POST", "/servers/fin/remove", {"csrf": csrf}, cookie=token)
+        self.assertIn("config.json", page, "the panel host itself cannot be removed from the UI")
+
+    def test_34_telegram_delivery(self):
+        token, csrf = self.login()
+        sent = []
+
+        def fake_tg(tok, method, fields=None, files=None, timeout=30):
+            sent.append((method, fields or {}, files or {}))
+            return {"username": "vpn_test_bot"} if method == "getMe" else {}
+        orig = delivery.tg_call
+        delivery.tg_call = fake_tg
+        try:
+            _, _, page = self.req("POST", "/settings/telegram", {"csrf": csrf, "tg_token": "123:ABCDEFGHIJKLMNOP"}, cookie=token)
+            self.assertIn("@vpn_test_bot", page)
+            self.assertNotIn("123:ABCDEFGHIJKLMNOP", page, "token is never shown back in full")
+            cid = self._new_client(token, csrf, "Телеграм клиент", "fin|awg3")
+            _, _, page = self.req("POST", f"/client/{cid}/tg-link", {"csrf": csrf}, cookie=token)
+            m = re.search(r"https://t\.me/vpn_test_bot\?start=([A-Za-z0-9_-]+)", page)
+            self.assertIsNotNone(m, "deep link shown")
+            upd = {"update_id": 1, "message": {"chat": {"id": 777}, "text": f"/start {m.group(1)}"}}
+            delivery._handle_update(self.cfg, self.db, "123:ABCDEFGHIJKLMNOP", upd)
+            methods = [x[0] for x in sent]
+            self.assertIn("sendPhoto", methods)
+            self.assertIn("sendDocument", methods)
+            doc = next(x for x in sent if x[0] == "sendDocument")
+            self.assertIn(b"HeaderProtectionKey", doc[2]["document"][1])
+            self.assertEqual(self.db.one("SELECT tg_chat_id FROM clients WHERE id=?", (cid,))["tg_chat_id"], 777)
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, "123:ABCDEFGHIJKLMNOP", dict(upd, update_id=2))
+            self.assertIn("недействительна", sent[-1][1]["text"], "deep link is one-time")
+            sent.clear()
+            _, _, page = self.req("POST", f"/client/{cid}/tg-send", {"csrf": csrf}, cookie=token)
+            self.assertIn("Отправлено в Telegram", page)
+            self.assertTrue(all(x[1].get("chat_id") == 777 for x in sent))
+        finally:
+            delivery.tg_call = orig
+
+    def test_35_email_delivery(self):
+        token, csrf = self.login()
+        box = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None, context=None):
+                box.append(("connect", host, port))
+
+            def starttls(self, context=None):
+                box.append(("starttls",))
+
+            def login(self, user, pw):
+                box.append(("login", user))
+
+            def send_message(self, msg):
+                box.append(("send", msg))
+
+            def quit(self):
+                pass
+        import smtplib
+        orig = smtplib.SMTP
+        smtplib.SMTP = FakeSMTP
+        delivery.smtplib.SMTP = FakeSMTP
+        try:
+            _, _, page = self.req("POST", "/settings/smtp", {"csrf": csrf, "smtp_host": "smtp.example.com", "smtp_port": "587",
+                                                             "smtp_security": "starttls", "smtp_user": "vpn@example.com",
+                                                             "smtp_pass": "mail-secret-1", "smtp_from": "VPN <vpn@example.com>"},
+                                  cookie=token)
+            self.assertIn("Сохранено", page)
+            self.assertNotIn("mail-secret-1", page)
+            cid = self._new_client(token, csrf, "Почтовый клиент", "fin|awg3")
+            _, _, page = self.req("POST", f"/client/{cid}/email", {"csrf": csrf, "email": "ivan@example.org"}, cookie=token)
+            self.assertIn("Письмо отправлено на ivan@example.org", page)
+            msg = next(x[1] for x in box if x[0] == "send")
+            self.assertEqual(msg["To"], "ivan@example.org")
+            names = [p.get_filename() for p in msg.iter_attachments()]
+            self.assertTrue(any(n and n.endswith(".conf") for n in names), names)
+            self.assertIn("image/png", [p.get_content_type() for p in msg.walk()])
+            _, _, page = self.req("POST", f"/client/{cid}/email", {"csrf": csrf, "email": "bad\r\nBcc: x@y"}, cookie=token)
+            self.assertIn("неверный адрес", page)
+        finally:
+            smtplib.SMTP = orig
+            delivery.smtplib.SMTP = orig
 
     def test_99_lockout_by_ip(self):
         # earlier tests already left a few failures from 127.0.0.1, so the block may come before the 5th try

@@ -26,7 +26,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.11" }
-      - name: unit + HTTP tests (fake awgctl)
+      - name: unit + HTTP tests (fake vpnctl)
         run: python -m unittest discover -s tests -p 'test_*.py' -v
 
   awg3:
@@ -37,12 +37,26 @@ jobs:
         run: docker build -t awg3:3.1.20260828 images/awg3
       - name: smoke — AWG 3.1 handshake with header protection
         run: sudo tests/smoke-awg3.sh awg3:3.1.20260828
-      - name: awgctl against real containers
+      - name: vpnctl AWG driver against real containers
         run: sudo tests/test-awgctl.sh awg3:3.1.20260828
+
+  sstp-vless:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build images
+        run: |
+          docker build -t sstp:1.14.0 images/sstp
+          docker build -t xray:26.3.27 images/xray
+          docker build -t vpnpanel-test-sstpc tests/sstp-client
+      - name: ppp kernel module
+        run: sudo modprobe ppp_generic && ls -la /dev/ppp
+      - name: vpnctl SSTP + VLESS with real clients
+        run: sudo tests/test-vpnctl.sh
 
   publish:
     if: github.event_name == 'push'
-    needs: [secrets, panel, awg3]
+    needs: [secrets, panel, awg3, sstp-vless]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -54,9 +68,13 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: build and push ghcr.io/${{ github.repository_owner }}/awg3
+      - name: build and push images to ghcr.io/${{ github.repository_owner }}
         run: |
-          IMG=ghcr.io/${{ github.repository_owner }}/awg3
-          docker build -t $IMG:3.1.20260828 -t $IMG:latest images/awg3
-          docker push $IMG:3.1.20260828
-          docker push $IMG:latest
+          set -e
+          O=ghcr.io/${{ github.repository_owner }}
+          for spec in awg3:3.1.20260828 sstp:1.14.0 xray:26.3.27; do
+            name=${spec%%:*}; tag=${spec#*:}
+            docker build -t $O/$name:$tag -t $O/$name:latest images/$name
+            docker push $O/$name:$tag
+            docker push $O/$name:latest
+          done

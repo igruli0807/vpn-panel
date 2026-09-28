@@ -29,11 +29,40 @@ def render(params, *, private_key, address, preshared_key, endpoint_host,
     return "\n".join(lines)
 
 
+def build(params, c, endpoint_host):
+    """-> dict describing what the client gets, per protocol:
+    text (to copy), qr (text for the QR or None), filename + mime (download), fields [(label, value)], cert_pem."""
+    kind = params.get("kind")
+    safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (c.get("name") or "vpn")).strip("_")[:40] or "vpn"
+    if kind == "sstp":
+        server = f"{endpoint_host}:{params['port']}"
+        fields = [("Сервер", server), ("Логин", c["pub"]), ("Пароль", c.get("secret") or "")]
+        text = "\n".join(f"{k}: {v}" for k, v in fields)
+        cert = params.get("cert_pem") if params.get("self_signed") else None
+        return {"kind": "sstp", "text": text, "qr": None, "filename": f"{safe}-sstp.txt", "mime": "text/plain",
+                "fields": fields, "cert_pem": cert, "cert_name": f"vpn-{endpoint_host}.crt"}
+    if kind == "vless":
+        import urllib.parse as up
+        q = {"encryption": "none", "flow": params.get("flow") or "xtls-rprx-vision", "security": "reality",
+             "sni": params["sni"], "fp": params.get("fp") or "chrome", "pbk": params["public_key"],
+             "sid": params["short_id"], "type": "tcp"}
+        uri = (f"vless://{c['pub']}@{endpoint_host}:{params['port']}?{up.urlencode(q)}"
+               f"#{up.quote(c.get('name') or 'VPN')}")
+        return {"kind": "vless", "text": uri, "qr": uri, "filename": f"{safe}-vless.txt", "mime": "text/plain",
+                "fields": [], "cert_pem": None}
+    conf = render(params, private_key=c["priv"], address=c["ip"], preshared_key=c.get("psk"),
+                  endpoint_host=endpoint_host)
+    return {"kind": kind, "text": conf, "qr": conf, "filename": f"{safe}.conf", "mime": "text/plain",
+            "fields": [], "cert_pem": None}
+
+
 APPS = {
     "awg3": "Amnezia VPN 5.0.1.5+ или AmneziaWG 3.1 (Android, Windows)",
     "awg2": "Amnezia VPN 4.8+ или AmneziaWG",
     "legacy": "Amnezia VPN или AmneziaWG",
     "wireguard": "WireGuard, Amnezia VPN или AmneziaWG",
+    "sstp": "встроенный VPN Windows, Open SSTP Client (Android), MikroTik",
+    "vless": "v2rayNG, Hiddify, Streisand, v2RayTun и другие клиенты Xray",
 }
 
 # Official download links (checked 28.09.2026 on amnezia.org, docs.amnezia.org, the stores).
@@ -62,16 +91,55 @@ _WIREGUARD = {
     "ios": [("WireGuard", "https://apps.apple.com/app/wireguard/id1441195209", "App Store", "")] + _AMNEZIA["ios"][1:2],
     "desktop": [("WireGuard — Windows, macOS, Linux", "https://www.wireguard.com/install/", "wireguard.com", "")],
 }
+# VLESS / SSTP links checked 28.09.2026 (iTunes lookup API for ru/us storefronts, Google Play pages, project READMEs).
+_VLESS = {
+    "android": [
+        ("Hiddify", "https://play.google.com/store/apps/details?id=app.hiddify.com", "Google Play", "бесплатно"),
+        ("Happ", "https://play.google.com/store/apps/details?id=com.happproxy", "Google Play", "бесплатно"),
+        ("v2rayNG", "https://github.com/2dust/v2rayNG/releases", "GitHub", "APK; из Google Play убран"),
+    ],
+    "ios": [
+        ("Shadowrocket", "https://apps.apple.com/app/shadowrocket/id932747118", "App Store",
+         "есть в российском App Store, платно (249 ₽)"),
+        ("Streisand", "https://apps.apple.com/us/app/streisand/id6450534064", "App Store",
+         "бесплатно; нет в российском App Store"),
+        ("Hiddify", "https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532", "App Store",
+         "бесплатно; нет в российском App Store"),
+    ],
+    "desktop": [
+        ("Hiddify — Windows, macOS, Linux", "https://github.com/hiddify/hiddify-app/releases/latest", "GitHub", ""),
+        ("v2rayN — Windows", "https://github.com/2dust/v2rayN/releases", "GitHub", ""),
+        ("Happ — Windows, macOS, Linux", "https://github.com/Happ-proxy/happ-desktop/releases/latest", "GitHub", ""),
+    ],
+}
+_SSTP = {
+    "android": [
+        ("Open SSTP Client", "https://play.google.com/store/apps/details?id=kittoku.osc", "Google Play",
+         "бесплатно; для самоподписанного сертификата выключите «Verify Hostname»"),
+        ("Open SSTP Client — APK", "https://github.com/kittoku/Open-SSTP-Client/releases", "GitHub", ""),
+    ],
+    "ios": [
+        ("SSTP Connect", "https://apps.apple.com/app/sstp-connect/id1543667909", "App Store",
+         "есть в российском App Store, платно (249 ₽); встроенного SSTP в iOS нет"),
+    ],
+    "desktop": [
+        ("Windows — встроенный VPN", "https://support.microsoft.com/ru-ru/windows/connect-to-a-vpn-in-windows-3d29aeb1-f497-f6b7-7633-115722c1009c",
+         "microsoft.com", "тип подключения «SSTP»"),
+        ("macOS — SSTP Connect", "https://apps.apple.com/app/sstp-connect/id1543667909", "App Store", "Apple Silicon"),
+        ("MikroTik — SSTP client", "https://help.mikrotik.com/docs/spaces/ROS/pages/2031645/SSTP", "mikrotik.com", ""),
+    ],
+}
 PLATFORMS = (("android", "Android"), ("ios", "iPhone и iPad"), ("desktop", "Компьютер"))
 VERSION_NOTE = {
     "awg3": "Протокол AWG 3.1 — нужна свежая версия приложения: Amnezia VPN 5.0.1.5+ или AmneziaWG 3.1. "
             "Если после импорта нет подключения — обновите приложение.",
+    "vless": "VLESS REALITY: импорт — сканом QR или ссылкой vless:// из буфера обмена.",
 }
 
 
 def app_links(kind):
     """-> {platform: [(name, url, where, note), ...]} for a container kind."""
-    return _WIREGUARD if kind == "wireguard" else _AMNEZIA
+    return {"wireguard": _WIREGUARD, "vless": _VLESS, "sstp": _SSTP}.get(kind, _AMNEZIA)
 
 
 def platform_of(user_agent):
@@ -88,9 +156,10 @@ def qr_svg(text, scale=4):
     import io
     import segno
     buf = io.BytesIO()
+    # omitsize: no width/height, a viewBox instead — so CSS can scale any QR version to the same size
     segno.make(text, error="l", micro=False).save(buf, kind="svg", scale=scale, border=2,
                                                    dark="#111", light="#fff", xmldecl=False,
-                                                   svgns=True, nl=False)
+                                                   svgns=True, nl=False, omitsize=True)
     return buf.getvalue().decode()
 
 

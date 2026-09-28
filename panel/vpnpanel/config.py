@@ -19,7 +19,7 @@ DEFAULTS = {
     "login_max_failures": 5,
     "login_window_minutes": 15,
     "login_block_minutes": 60,
-    "awgctl": "/usr/local/sbin/awgctl",
+    "awgctl": "/usr/local/sbin/vpnctl",   # key name kept for old configs
     "use_sudo": True,
     # Peers that must never be disabled or deleted from the panel (e.g. an admin's own tunnel).
     "protected_pubkeys": [],
