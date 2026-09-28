@@ -288,7 +288,7 @@ class PanelTest(unittest.TestCase):
         self.assertEqual(self.req("GET", invite)[0], 200)
         st, _, page = self.req("POST", invite, {"password": "short", "password2": "short"})
         self.assertEqual(st, 400)
-        st, h, _ = self.req("POST", invite, {"password": "petrov-pass-123", "password2": "petrov-pass-123"})
+        st, h, _ = self.req("POST", invite, {"password": "petrov-pass-123", "password2": "petrov-pass-123"})  # gitleaks:allow (test fixture password)
         self.assertEqual(st, 303, "invite should log the colleague in")
         adm = self.token_of(h)
         self.assertEqual(self.req("GET", invite)[0], 404, "invite link is one-time")
@@ -311,7 +311,7 @@ class PanelTest(unittest.TestCase):
         _, _, page = self.req("GET", "/log", cookie=adm)
         self.assertIn("Колле клиент", page)
         self.assertNotIn("Иван", page, "admin must not see events of other servers")
-        self.assertEqual(self.req("POST", "/login", {"login": "petrov", "password": "petrov-pass-123"})[0], 303,
+        self.assertEqual(self.req("POST", "/login", {"login": "petrov", "password": "petrov-pass-123"})[0], 303,  # gitleaks:allow (test fixture password)
                          "logins are case-insensitive")
 
     def test_21_password_change_closes_other_sessions(self):
@@ -346,7 +346,7 @@ class PanelTest(unittest.TestCase):
         _, _, page = self.req("POST", f"/users/{uid}/reset", {"csrf": csrf}, cookie=token)
         self.assertIn("/invite/", page)
         self.assertEqual(self.req("GET", "/", cookie=adm)[0], 303, "reset closes the colleague's sessions")
-        self.assertEqual(self.req("POST", "/login", {"login": "petrov", "password": "petrov-pass-123"})[0], 401,
+        self.assertEqual(self.req("POST", "/login", {"login": "petrov", "password": "petrov-pass-123"})[0], 401,  # gitleaks:allow (test fixture password)
                          "old password stops working after reset")
         inv = self.db.one("SELECT id FROM invites WHERE user_id=? AND used_at IS NULL", (uid,))
         self.db.x("UPDATE invites SET expires=? WHERE id=?", (int(time.time()) - 1, inv["id"]))

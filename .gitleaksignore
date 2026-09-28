@@ -1,0 +1,4 @@
+# Тестовые пароли в tests/test_panel.py (не секреты) — коммит до пометок gitleaks:allow
+2cf9241ec3ed57cb8a1191b624e0ec4196c8c990:tests/test_panel.py:generic-api-key:291
+2cf9241ec3ed57cb8a1191b624e0ec4196c8c990:tests/test_panel.py:generic-api-key:314
+2cf9241ec3ed57cb8a1191b624e0ec4196c8c990:tests/test_panel.py:generic-api-key:349
