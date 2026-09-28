@@ -106,7 +106,7 @@ def layout(title, body, me=None, active="", page_cls="page"):
 </nav>"""
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{e(title)} — VPN-панель</title><link rel="stylesheet" href="/static/app.css"></head>
+<title>{e(title)} — VPN-панель</title><link rel="icon" type="image/svg+xml" href="/static/favicon.svg"><link rel="stylesheet" href="/static/app.css"></head>
 <body class="app">{nav}<main class="{page_cls}">{body}</main><script src="/static/app.js"></script></body></html>"""
 
 
@@ -114,7 +114,7 @@ def bare(title, body):
     """Pages without navigation: login, invite, public share."""
     return f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{e(title)}</title><link rel="stylesheet" href="/static/app.css"></head>
+<title>{e(title)}</title><link rel="icon" type="image/svg+xml" href="/static/favicon.svg"><link rel="stylesheet" href="/static/app.css"></head>
 <body class="app">{body}<script src="/static/app.js"></script></body></html>"""
 
 

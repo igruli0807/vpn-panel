@@ -150,6 +150,8 @@ def make_handler(app):
             try:
                 if path.startswith("/static/"):
                     return self.static(path[len("/static/"):])
+                if path == "/favicon.ico":
+                    return self.static("favicon.svg")
                 if path == "/login":
                     return self.send(200, views.login_page())
                 m = re.fullmatch(r"/s/([A-Za-z0-9_-]{20,100})", path)
@@ -226,11 +228,13 @@ def make_handler(app):
 
         # ---- auth ----
         def static(self, name):
-            if name not in ("app.css", "app.js"):
+            types = {"app.css": "text/css; charset=utf-8", "app.js": "application/javascript; charset=utf-8",
+                     "favicon.svg": "image/svg+xml"}
+            if name not in types:
                 return self.send(404, "not found", "text/plain")
             with open(os.path.join(STATIC, name), "rb") as fh:
                 data = fh.read()
-            ctype = "text/css; charset=utf-8" if name.endswith(".css") else "application/javascript; charset=utf-8"
+            ctype = types[name]
             self.send(200, data, ctype)
 
         def login(self, f):
