@@ -29,7 +29,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "2.0.0"
+VERSION = "2.0.2"
 _env = lambda k, d: os.environ.get("VPNCTL_" + k) or os.environ.get("AWGCTL_" + k) or d
 BACKUP_DIR = _env("BACKUP_DIR", "/var/backups/vpnctl")
 BACKUP_KEEP = 20
@@ -617,7 +617,15 @@ def sstp_params(name):
     cert_path = u["cert"] if u["host"] else f"{SSTP_DIR}/{os.path.basename(ini_get(text, 'sstp', 'ssl-pemfile') or 'server.crt')}"
     pem = host_read(cert_path, "") or ""
     return {"kind": "sstp", "port": int(ini_get(text, "sstp", "port") or 0), "cert_pem": pem,
-            "self_signed": cert_self_signed(cert_path) if pem else True}
+            "self_signed": cert_self_signed(cert_path) if pem else True, "cert_name": cert_cn(cert_path) if pem else ""}
+
+
+def cert_cn(pem_path):
+    """CN of the server certificate: clients must connect by this name for the certificate to validate."""
+    p = subprocess.run(["openssl", "x509", "-in", pem_path, "-noout", "-subject", "-nameopt", "multiline"],
+                       capture_output=True, text=True)
+    m = re.search(r"commonName\s*=\s*(\S+)", p.stdout)
+    return m.group(1) if m else ""
 
 
 def check_user(user):
@@ -1125,6 +1133,12 @@ def install_sstp(a):
         host_write("sstp", conf, SSTP_CONF_TEMPLATE.format(port=port), 0o644)
     if not os.path.exists(f"{SSTP_DIR}/chap-secrets"):
         host_write("sstp", f"{SSTP_DIR}/chap-secrets", "", 0o600)
+    if a.cert or a.key:
+        if not (a.cert and a.key and os.path.isfile(a.cert) and os.path.isfile(a.key)):
+            raise Fail("--cert and --key must both point to existing files")
+        say(f"using certificate {a.cert}")
+        host_write("sstp", f"{SSTP_DIR}/server.crt", host_read(a.cert), 0o644)
+        host_write("sstp", f"{SSTP_DIR}/server.key", host_read(a.key), 0o600)
     if not os.path.exists(f"{SSTP_DIR}/server.crt"):
         ip = public_ip()
         san = f"IP:{ip}" + (f",DNS:{a.domain}" if a.domain else "")
@@ -1346,6 +1360,8 @@ def build_parser():
     ins.add_argument("--port", type=int)
     ins.add_argument("--sni", default="")
     ins.add_argument("--domain", default="")
+    ins.add_argument("--cert", default="", help="sstp: certificate chain file to use instead of a self-signed one")
+    ins.add_argument("--key", default="", help="sstp: private key for --cert")
     un = sub.add_parser("uninstall")
     un.add_argument("proto", choices=sorted(INSTALLERS))
     for name in ("preflight", "unlink", "version"):

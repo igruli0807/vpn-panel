@@ -35,7 +35,9 @@ def build(params, c, endpoint_host):
     kind = params.get("kind")
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (c.get("name") or "vpn")).strip("_")[:40] or "vpn"
     if kind == "sstp":
-        server = f"{endpoint_host}:{params['port']}"
+        # a real certificate validates only by its name — use it instead of the server IP
+        host = params.get("cert_name") if (not params.get("self_signed") and params.get("cert_name")) else endpoint_host
+        server = f"{host}:{params['port']}"
         fields = [("Сервер", server), ("Логин", c["pub"]), ("Пароль", c.get("secret") or "")]
         text = "\n".join(f"{k}: {v}" for k, v in fields)
         cert = params.get("cert_pem") if params.get("self_signed") else None
