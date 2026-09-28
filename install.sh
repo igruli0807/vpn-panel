@@ -9,6 +9,8 @@
 #       run on a VPN host: install a protocol in docker (awg3 / sstp / xray container) + vpnctl
 #   ./install.sh server --remove --proto awg3|sstp|vless
 #   Servers can also be added and protocols installed from the panel UI («Серверы»).
+#   ./install.sh backup [--to HOST] [--ssh-port 22]
+#       run on the panel host: nightly encrypted backup (local 7 copies; with --to also to HOST, 14 copies there)
 #
 # Re-running any mode is safe. Nothing secret is written into the repository directory.
 set -euo pipefail
@@ -196,9 +198,41 @@ cmd_server() {
   vpnctl install "$proto" ${port:+--port "$port"} ${sni:+--sni "$sni"}
 }
 
+# ---------------------------------------------------------------- backup
+cmd_backup() {
+  need_root
+  local to="" sshport=22
+  while [ $# -gt 0 ]; do case "$1" in
+    --to) to=$2; shift 2 ;; --ssh-port) sshport=$2; shift 2 ;; *) die "unknown option $1" ;; esac; done
+  [ -f $ETC/config.json ] || die "install the panel first: ./install.sh panel"
+  sync_code
+  install -m 755 "$PREFIX/deploy/vpn-panel-backup.sh" /usr/local/sbin/vpn-panel-backup.sh
+  install -m 644 "$PREFIX/deploy/vpn-panel-backup.service" "$PREFIX/deploy/vpn-panel-backup.timer" /etc/systemd/system/
+  if [ ! -f $ETC/backup.pass ]; then
+    (umask 077; openssl rand -base64 48 > $ETC/backup.pass)
+    say "backup passphrase created: $ETC/backup.pass — COPY IT SOMEWHERE SAFE, backups are useless without it"
+  fi
+  if [ -n "$to" ]; then
+    [ -f $ETC/ssh/backup_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -C "vpn-panel-backup@$(hostname -s)" -f $ETC/ssh/backup_ed25519
+    local me pub
+    me=$(public_ip); pub=$(cat $ETC/ssh/backup_ed25519.pub)
+    say "installing the receiver on root@$to (your own SSH access, once)"
+    ssh -p "$sshport" "root@$to" "cat > /usr/local/sbin/vpn-backup-recv && chmod 755 /usr/local/sbin/vpn-backup-recv" < "$PREFIX/server/vpn-backup-recv"
+    ssh -p "$sshport" "root@$to" "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys &&
+      (grep -v 'vpn-panel-backup@' /root/.ssh/authorized_keys > /root/.ssh/ak.tmp || true) &&
+      echo 'command=\"/usr/local/sbin/vpn-backup-recv\",from=\"$me\",no-pty,no-port-forwarding,no-agent-forwarding,no-X11-forwarding $pub' >> /root/.ssh/ak.tmp &&
+      chmod 600 /root/.ssh/ak.tmp && mv /root/.ssh/ak.tmp /root/.ssh/authorized_keys"
+    printf 'BACKUP_HOST=%s\nBACKUP_PORT=%s\n' "$to" "$sshport" > $ETC/backup.env
+  fi
+  systemctl daemon-reload
+  systemctl enable --now vpn-panel-backup.timer >/dev/null 2>&1
+  /usr/local/sbin/vpn-panel-backup.sh
+}
+
 case "${1:-}" in
   panel) shift; cmd_panel "$@" ;;
   add-server) shift; cmd_add_server "$@" ;;
   server) shift; cmd_server "$@" ;;
-  *) sed -n '2,13p' "$0"; exit 2 ;;
+  backup) shift; cmd_backup "$@" ;;
+  *) sed -n '2,16p' "$0"; exit 2 ;;
 esac

@@ -1,0 +1,15 @@
+#!/bin/bash
+# Receiving end of the panel's off-site backup. Runs as a forced command:
+#   command="/usr/local/sbin/vpn-backup-recv",from="<panel IP>",no-pty,no-port-forwarding ssh-ed25519 ... vpn-panel-backup@...
+# Accepts only "vpn-backup-recv <name>.tgz.enc", writes stdin (max 100 MB) to /var/backups/vpn-panel-remote, keeps 14.
+set -euo pipefail
+DIR=/var/backups/vpn-panel-remote
+KEEP=14
+read -r cmd name extra <<<"${SSH_ORIGINAL_COMMAND:-}"
+[ "$cmd" = "vpn-backup-recv" ] && [ -z "${extra:-}" ] || { echo "only vpn-backup-recv <name> is allowed" >&2; exit 2; }
+[[ "$name" =~ ^panel-[a-z0-9-]+-[0-9]{8}-[0-9]{4}\.tgz\.enc$ ]] || { echo "bad name" >&2; exit 2; }
+install -d -m 700 "$DIR"
+head -c 104857600 > "$DIR/$name.part"
+chmod 600 "$DIR/$name.part"; mv "$DIR/$name.part" "$DIR/$name"
+ls -1t "$DIR"/panel-*.tgz.enc | tail -n +$((KEEP + 1)) | xargs -r rm -f
+echo "stored $name"

@@ -1,0 +1,7 @@
+[Unit]
+Description=Encrypted backup of the VPN panel
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/vpn-panel-backup.sh
