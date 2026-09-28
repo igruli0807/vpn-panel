@@ -61,6 +61,17 @@ def client_rows(cfg, db, where="1=1", args=()):
     return rows
 
 
+def selfsigned_url(cfg):
+    """True when the panel is reached by a bare IP (self-signed certificate, browsers warn)."""
+    import ipaddress
+    host = urllib.parse.urlsplit(cfg.get("public_url") or "").hostname or ""
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        return not host
+
+
 class App:
     def __init__(self, cfg, db):
         self.cfg, self.db = cfg, db
@@ -327,7 +338,7 @@ def make_handler(app):
                         "title": f"{titles.get(h['server'], h['server'])} — AWG 3.1 (UDP {h['port']})"}
                        for h in visible_health(me) if h["kind"] == "awg3" and h["up"]]
             self.send(200, views.client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets,
-                                             c["protected"], error, new_link, notice))
+                                             c["protected"], error, new_link, notice, selfsigned_url(cfg)))
 
         def create(self, me, f):
             try:

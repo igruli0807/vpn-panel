@@ -298,7 +298,7 @@ def chart(points, fmt):
 
 
 def client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets, protected,
-                error="", new_link="", notice=""):
+                error="", new_link="", notice="", selfsigned=True):
     now = int(time.time())
     title = c["name"] or "(без имени)"
     dot, st = _row_state(c, now)
@@ -349,7 +349,7 @@ def client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets, pro
 <button class="btn" type="button" data-copy="conf">Копировать текст</button></div>
 <textarea id="conf" readonly class="hidden-ta" tabindex="-1" aria-hidden="true">{e(conf)}</textarea></div>
 <div class="pb apps-pb"><div class="lb">Приложения для клиента</div>{apps_block(kind, "android", compact=True)}</div></section>""")
-        side.append(_share_block(me, fmt, c, shares, new_link, now))
+        side.append(_share_block(me, fmt, c, shares, new_link, now, selfsigned))
     elif not c["deleted"] and not protected:
         mig = _migrate_form(me, c, targets) if targets and not c["migrated_to"] else ""
         side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div><div class="pb">
@@ -369,9 +369,11 @@ def _migrate_form(me, c, targets):
 <span class="hint">Создаст нового клиента с тем же именем и откроет его карточку. Старый получит метку «переехал».</span></form>"""
 
 
-def _share_block(me, fmt, c, shares, new_link, now):
+def _share_block(me, fmt, c, shares, new_link, now, selfsigned=True):
     if c["deleted"]:
         return ""
+    cert_note = (f'<p class="note">{I_INFO}Браузер клиента предупредит о сертификате — это ожидаемо: '
+                 f'нужно нажать «Дополнительно» → «Перейти на сайт».</p>' if selfsigned else "")
     box = ""
     if new_link:
         box = f"""<div class="linkbox"><div class="row between"><span class="lt">Ссылка создана</span><span class="small muted">показана один раз</span></div>
@@ -403,7 +405,7 @@ def _share_block(me, fmt, c, shares, new_link, now):
 <label class="chk"><input type="checkbox" name="one_time" value="1" checked>одноразовая</label>
 <button class="btn pri" type="submit">Создать ссылку</button></form>
 {box}
-<p class="note">{I_INFO}Браузер клиента предупредит о сертификате — это ожидаемо: нужно нажать «Дополнительно» → «Перейти на сайт».</p>
+{cert_note}
 {table}</div></section>"""
 
 
