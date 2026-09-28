@@ -676,6 +676,71 @@ class PanelTest(unittest.TestCase):
         finally:
             delivery.tg_call = orig
 
+    def test_37_bot_admin_menu(self):
+        sent = []
+
+        def fake_tg(tok, method, fields=None, files=None, timeout=30):
+            sent.append((method, fields or {}, files or {}))
+            return {"message_id": 99}
+        orig = delivery.tg_call
+        delivery.tg_call = fake_tg
+        T = "123:X"
+        try:
+            self.db.set("tg_token", T)
+            self.db.set("tg_username", "vpn_test_bot")
+            self.db.x("UPDATE users SET tg_chat_id=3003 WHERE login='admin'")
+            msg = lambda chat, text, uid: {"update_id": uid, "message": {"chat": {"id": chat, "type": "private"}, "text": text}}
+            cb = lambda chat, data, uid: {"update_id": uid, "callback_query": {"id": "q", "data": data, "from": {},
+                                                                              "message": {"chat": {"id": chat}, "message_id": 5, "text": ""}}}
+            last = lambda: [x for x in sent if x[0] != "answerCallbackQuery"][-1]
+            delivery._handle_update(self.cfg, self.db, T, msg(3003, "/start", 100))
+            self.assertIn("Клиенты", sent[-1][1]["reply_markup"])
+            self.assertNotIn("Запросить доступ", sent[-1][1]["reply_markup"], "owner gets the menu, not the request button")
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, "m:cl:0", 101))
+            self.assertEqual(last()[0], "editMessageText")
+            self.assertIn("Old phone", last()[1]["reply_markup"])
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, "m:new", 102))
+            tl = json.loads(self.db.one("SELECT data FROM tg_state WHERE chat_id=3003")["data"])["targets"]
+            i = next(i for i, t in enumerate(tl) if t[:2] == ["fin", "awg3"])
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:nt:{i}", 103))
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, msg(3003, "Бот клиент", 104))
+            c = self.db.one("SELECT * FROM clients WHERE name='Бот клиент'")
+            self.assertIsNotNone(c, "client created from Telegram")
+            self.assertTrue(any(x[0] == "sendPhoto" and x[1]["chat_id"] == 3003 for x in sent), "config sent to the owner")
+            self.assertTrue(any("Создан" in x[1].get("text", "") for x in sent))
+            peers = FAKES["fin"].containers["awg3"]["peers"]
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:off:{c['id']}", 105))
+            self.assertTrue(peers[c["pub"]]["disabled"])
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:on:{c['id']}", 106))
+            self.assertFalse(peers[c["pub"]]["disabled"])
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:ext:{c['id']}", 107))
+            self.assertGreater(self.db.one("SELECT expires FROM clients WHERE id=?", (c["id"],))["expires"], time.time() + 29 * 86400)
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:lk:{c['id']}", 108))
+            self.assertIn("t.me/vpn_test_bot?start=", sent[0][1]["text"])
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:del:{c['id']}", 109))
+            self.assertIn("Удалить", last()[1]["text"])
+            self.assertIn(c["pub"], peers, "delete asks for confirmation first")
+            delivery._handle_update(self.cfg, self.db, T, cb(3003, f"m:delok:{c['id']}", 110))
+            self.assertNotIn(c["pub"], peers)
+            # stranger cannot use the menu
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(9999, "m:cl:0", 111))
+            self.assertIn("Нет доступа", sent[-1][1]["text"])
+            # admin account limited to USA
+            uid = self.db.x("INSERT INTO users(login, name, role, pw_hash, servers, created, tg_chat_id) VALUES('botadm','','admin','x','[\"usa\"]',?,4004)",
+                            (int(time.time()),))
+            sent.clear()
+            delivery._handle_update(self.cfg, self.db, T, cb(4004, "m:cl:0", 112))
+            kb = last()[1]["reply_markup"]
+            self.assertIn("USA client", kb)
+            self.assertNotIn("Old phone", kb)
+            self.db.x("DELETE FROM users WHERE id=?", (uid,))
+        finally:
+            delivery.tg_call = orig
+            self.db.x("DELETE FROM settings WHERE key IN ('tg_token','tg_username')")
+
     def test_40_alerts_to_owner(self):
         sent = []
         orig = delivery.tg_call

@@ -206,6 +206,10 @@ def _start(cfg, db, token, chat, arg, frm):
         db.x("UPDATE clients SET tg_chat_id=? WHERE id=?", (chat, c["id"]))
         _send_or_apologise(cfg, db, token, c, chat, "по ссылке")
         return
+    from . import botadmin
+    me = botadmin._me(db, chat)
+    if me:  # a panel account: management menu instead of the request button
+        return botadmin.home(cfg, db, token, chat, me)
     rows = [[("🔑 Запросить доступ к VPN", "req")]]
     if _bound_client(db, chat):
         rows.insert(0, [("📄 Прислать мои настройки ещё раз", "resend")])
@@ -230,7 +234,11 @@ def _callback(cfg, db, token, cq):
     frm = cq.get("from") or {}
     answer = ""
     try:
-        if data == "req":
+        if data.startswith("m:"):
+            from . import botadmin
+            me = botadmin._me(db, chat)
+            answer = (botadmin.handle_callback(cfg, db, token, cq, me) or "") if me else "Нет доступа: Telegram не привязан к учётке панели"
+        elif data == "req":
             full = " ".join(x for x in (frm.get("first_name"), frm.get("last_name")) if x)
             r, new = rq.create(db, chat, frm.get("username"), full)
             if new:
@@ -290,6 +298,10 @@ def _handle_update(cfg, db, token, upd):
         return
     if text.startswith("/start"):
         return _start(cfg, db, token, chat, text[6:].strip(), msg.get("from") or {})
+    from . import botadmin
+    me = botadmin._me(db, chat)
+    if me:
+        return botadmin.handle_text(cfg, db, token, chat, text, me)
     tg_call(token, "sendMessage", {"chat_id": chat, "reply_markup": _kb([[("🔑 Запросить доступ к VPN", "req")]]),
                                    "text": "Этот бот выдаёт настройки VPN после одобрения администратора."})
 
