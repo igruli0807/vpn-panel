@@ -1,0 +1,3 @@
+# vpn-panel: fewer attempts per connection and a shorter login window (password brute force)
+MaxAuthTries 3
+LoginGraceTime 20

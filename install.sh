@@ -308,7 +308,7 @@ cmd_harden() {
   done
   install -m 755 "$PREFIX/server/ssh-ratelimit.sh" /usr/local/sbin/ssh-ratelimit.sh
   install -m 644 "$PREFIX/server/ssh-ratelimit.service" /etc/systemd/system/ssh-ratelimit.service
-  install -m 644 "$PREFIX/server/sshd-hardening.conf" /etc/ssh/sshd_config.d/10-vpn-panel-hardening.conf
+  install -m 644 "$PREFIX/server/sshd-hardening" /etc/ssh/sshd_config.d/10-vpn-panel-hardening.conf
   sshd -t && systemctl reload ssh || die "sshd config check failed"
   systemctl daemon-reload; systemctl enable --now ssh-ratelimit.service >/dev/null 2>&1; systemctl restart ssh-ratelimit.service
   printf '/var/log/btmp {\n    missingok\n    monthly\n    maxsize 20M\n    create 0660 root utmp\n    rotate 1\n}\n' > /etc/logrotate.d/btmp
