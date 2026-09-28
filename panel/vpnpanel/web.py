@@ -1,4 +1,4 @@
-"""HTTP(S) server on the standard library: routing, cookies, CSRF, security headers."""
+"""HTTP(S) server on the standard library: routing, cookies, CSRF, per-user access, security headers."""
 import http.cookies
 import logging
 import os
@@ -9,8 +9,9 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import auth, clientconf, runner, service, views
-from .service import KIND_TITLE, OpError
+from . import access, accounts, auth, clientconf, runner, service, views
+from .accounts import AccountError
+from .service import OpError
 
 log = logging.getLogger("vpnpanel.web")
 STATIC = os.path.join(os.path.dirname(__file__), "static")
@@ -69,6 +70,14 @@ class App:
 def make_handler(app):
     cfg, db, fmt = app.cfg, app.db, app.fmt
 
+    def visible_servers(me):
+        ids = set(access.servers(cfg, me))
+        return [s for s in cfg["servers"] if s["id"] in ids]
+
+    def visible_health(me):
+        where, args = access.sql(cfg, me, "server")
+        return db.q(f"SELECT * FROM health WHERE {where} ORDER BY server, container", args)
+
     class H(BaseHTTPRequestHandler):
         server_version = "vpn-panel"
         sys_version = ""
@@ -88,6 +97,9 @@ def make_handler(app):
 
         def sess(self):
             return auth.session(db, self.cookie())
+
+        def event(self, me, text, server=None):
+            db.event(text, self.ip, me["user_id"] if me else None, server)
 
         def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
             data = body.encode() if isinstance(body, str) else body
@@ -112,18 +124,21 @@ def make_handler(app):
             h.update(headers or {})
             self.send(303, "", headers=h)
 
+        def set_cookie(self, token):
+            return {"Set-Cookie": f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; "
+                                  f"Max-Age={cfg['session_hours'] * 3600}"}
+
         def form(self):
             n = int(self.headers.get("Content-Length") or 0)
             if n > MAX_BODY:
+                self.multi = {}
                 return {}
             raw = self.rfile.read(n).decode("utf-8", "replace")
-            return {k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()}
+            self.multi = urllib.parse.parse_qs(raw, keep_blank_values=True)
+            return {k: v[0] for k, v in self.multi.items()}
 
-        def need_login(self):
-            s = self.sess()
-            if not s:
-                self.redirect("/login")
-            return s
+        def nf(self, me, msg="Нет такой страницы."):
+            self.send(404, views.not_found(msg, me))
 
         # ---- routing ----
         def do_HEAD(self):
@@ -140,19 +155,35 @@ def make_handler(app):
                 m = re.fullmatch(r"/s/([A-Za-z0-9_-]{20,100})", path)
                 if m:
                     return self.share(m.group(1))
-                s = self.need_login()
-                if not s:
-                    return
+                m = re.fullmatch(r"/invite/([A-Za-z0-9_-]{20,100})", path)
+                if m:
+                    u = auth.invite_user(db, m.group(1))
+                    return self.send(200, views.invite_page(u)) if u else self.send(404, views.link_invalid())
+                me = self.sess()
+                if not me:
+                    return self.redirect("/login")
                 if path == "/":
-                    return self.dashboard(s, qs)
+                    return self.dashboard(me, qs)
                 if path == "/new":
-                    return self.send(200, views.new_page(s, cfg["servers"], db.q("SELECT * FROM health")))
+                    return self.send(200, views.new_page(me, visible_servers(me), visible_health(me)))
                 if path == "/log":
-                    return self.send(200, views.log_page(s, fmt, db.q("SELECT * FROM events ORDER BY id DESC LIMIT 300")))
+                    return self.journal(me)
+                if path == "/me":
+                    return self.profile(me)
                 m = re.fullmatch(r"/client/(\d+)", path)
                 if m:
-                    return self.client(s, int(m.group(1)))
-                self.send(404, views.not_found("Нет такой страницы."))
+                    return self.client(me, int(m.group(1)), notice=self.notice(qs))
+                if path.startswith("/users"):
+                    if not access.is_owner(me):
+                        return self.nf(me)
+                    if path == "/users":
+                        return self.users(me)
+                    if path == "/users/new":
+                        return self.send(200, views.user_form_page(me, fmt, None, cfg["servers"]))
+                    m = re.fullmatch(r"/users/(\d+)", path)
+                    if m:
+                        return self.user_form(me, int(m.group(1)))
+                self.nf(me)
             except Exception:
                 log.exception("GET %s", path)
                 self.send(500, views.not_found("Внутренняя ошибка панели, подробности в журнале сервера."))
@@ -163,30 +194,37 @@ def make_handler(app):
             try:
                 if path == "/login":
                     return self.login(f)
-                s = self.sess()
-                if not s:
+                m = re.fullmatch(r"/invite/([A-Za-z0-9_-]{20,100})", path)
+                if m:
+                    return self.invite(m.group(1), f)
+                me = self.sess()
+                if not me:
                     return self.redirect("/login")
-                if not auth.csrf_ok(s, f.get("csrf")):
-                    return self.send(403, views.not_found("Форма устарела, обновите страницу."))
+                if not auth.csrf_ok(me, f.get("csrf")):
+                    return self.send(403, views.not_found("Форма устарела, обновите страницу.", me))
                 if path == "/logout":
                     auth.logout(db, self.cookie())
                     return self.redirect("/login", {"Set-Cookie": f"{COOKIE}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Strict"})
                 if path == "/new":
-                    return self.create(s, f)
+                    return self.create(me, f)
+                if path.startswith("/me/"):
+                    return self.profile_post(me, path[4:], f)
                 m = re.fullmatch(r"/client/(\d+)/(disable|enable|delete|rename|share|migrate)", path)
                 if m:
-                    return self.action(s, int(m.group(1)), m.group(2), f)
+                    return self.action(me, int(m.group(1)), m.group(2), f)
                 m = re.fullmatch(r"/share/(\d+)/revoke", path)
                 if m:
-                    service.revoke_share(db, int(m.group(1)))
-                    db.event(f"ссылка #{m.group(1)} отозвана", self.ip)
-                    return self.redirect(f"/client/{int(f.get('client') or 0)}")
-                self.send(404, views.not_found("Нет такой страницы."))
+                    return self.revoke(me, int(m.group(1)))
+                if path.startswith("/users"):
+                    if not access.is_owner(me):
+                        return self.nf(me)
+                    return self.users_post(me, path, f)
+                self.nf(me)
             except Exception:
                 log.exception("POST %s", path)
                 self.send(500, views.not_found("Внутренняя ошибка панели, подробности в журнале сервера."))
 
-        # ---- pages ----
+        # ---- auth ----
         def static(self, name):
             if name not in ("app.css", "app.js"):
                 return self.send(404, "not found", "text/plain")
@@ -196,19 +234,47 @@ def make_handler(app):
             self.send(200, data, ctype)
 
         def login(self, f):
-            r = auth.login(cfg, db, self.ip, f.get("password", ""))
+            login_name = (f.get("login") or "").strip()[:64]
+            r = auth.login(cfg, db, self.ip, login_name, f.get("password", ""))
             if r == "blocked":
-                return self.send(429, views.login_page("Слишком много неудачных попыток. Попробуйте через час."))
+                db.event(f"вход заблокирован на час: {login_name or '—'}", self.ip)
+                return self.send(429, views.login_page(locked=True, login=login_name))
             if not r:
-                return self.send(401, views.login_page("Неверный пароль."))
-            token, _ = r
-            db.event("вход в панель", self.ip)
-            self.redirect("/", {"Set-Cookie": f"{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; "
-                                              f"Max-Age={cfg['session_hours'] * 3600}"})
+                db.event(f"неудачный вход: {login_name or '—'}", self.ip)
+                return self.send(401, views.login_page("Неверный логин или пароль.", login=login_name))
+            me = auth.session(db, r)
+            self.event(me, "вход в панель")
+            self.redirect("/", self.set_cookie(r))
 
-        def dashboard(self, s, qs):
+        def invite(self, token, f):
+            u = auth.invite_user(db, token)
+            if not u:
+                return self.send(404, views.link_invalid())
+            if f.get("password") != f.get("password2"):
+                return self.send(400, views.invite_page(u, "пароли не совпали"))
+            try:
+                u, sess_token = auth.use_invite(cfg, db, token, f.get("password", ""), self.ip)
+            except ValueError as ex:
+                return self.send(400, views.invite_page(u, str(ex)))
+            db.event(f"пароль задан по приглашению: {u['login']}", self.ip, u["id"])
+            self.redirect("/", self.set_cookie(sess_token))
+
+        # ---- clients ----
+        def own_client(self, me, cid):
+            """Client row if it exists and is on one of this user's servers; else None (-> 404)."""
+            rows = client_rows(cfg, db, "c.id=?", (cid,))
+            if not rows or not access.can(cfg, me, rows[0]["server"]):
+                return None
+            return rows[0]
+
+        @staticmethod
+        def notice(qs):
+            return {"created": "Клиент создан. Покажите QR-код или создайте ссылку."}.get(qs.get("ok", ""), "")
+
+        def dashboard(self, me, qs):
             filters = {k: (qs.get(k) or "").strip()[:64] for k in ("server", "container", "status", "q")}
-            where, args = ["1=1"], []
+            acc, acc_args = access.sql(cfg, me)
+            where, args = [acc], list(acc_args)
             if filters["server"]:
                 where.append("c.server=?"); args.append(filters["server"])
             if filters["container"]:
@@ -230,15 +296,15 @@ def make_handler(app):
             if filters["q"]:
                 where.append("(c.name LIKE ? OR c.ip LIKE ?)"); args += [f"%{filters['q']}%"] * 2
             rows = client_rows(cfg, db, " AND ".join(where), args)
-            health = db.q("SELECT * FROM health ORDER BY server, container")
-            self.send(200, views.dashboard(s, fmt, cfg["servers"], health, db.q("SELECT * FROM server_health"),
+            sh_where, sh_args = access.sql(cfg, me, "server")
+            self.send(200, views.dashboard(me, fmt, visible_servers(me), visible_health(me),
+                                           db.q(f"SELECT * FROM server_health WHERE {sh_where}", sh_args),
                                            rows, filters, now))
 
-        def client(self, s, cid, error="", new_link=""):
-            rows = client_rows(cfg, db, "c.id=?", (cid,))
-            if not rows:
-                return self.send(404, views.not_found("Нет такого клиента."))
-            c = rows[0]
+        def client(self, me, cid, error="", new_link="", notice=""):
+            c = self.own_client(me, cid)
+            if not c:
+                return self.nf(me, "Нет такого клиента.")
             server = cfg.server(c["server"])
             conf = qr = None
             kind = c["kind"]
@@ -254,24 +320,29 @@ def make_handler(app):
                 (c["server"], c["container"], c["pub"], int(time.time()) - 7 * 86400))]
             titles = {x["id"]: x.get("title", x["id"]) for x in cfg["servers"]}
             targets = [{"server": h["server"], "container": h["container"],
-                        "title": f"{titles.get(h['server'], h['server'])} — AWG 3.1"}
-                       for h in db.q("SELECT * FROM health WHERE kind='awg3' AND up=1")]
-            self.send(200, views.client_page(s, fmt, c, server, conf, kind, qr, shares, points, targets,
-                                             c["protected"], error, new_link))
+                        "title": f"{titles.get(h['server'], h['server'])} — AWG 3.1 (UDP {h['port']})"}
+                       for h in visible_health(me) if h["kind"] == "awg3" and h["up"]]
+            self.send(200, views.client_page(me, fmt, c, server, conf, kind, qr, shares, points, targets,
+                                             c["protected"], error, new_link, notice))
 
-        def create(self, s, f):
+        def create(self, me, f):
             try:
                 sid, container = (f.get("target") or "|").split("|", 1)
+                if not access.can(cfg, me, sid):
+                    raise OpError("нет доступа к этому серверу")
                 cid = service.create_client(cfg, db, sid, container, f.get("name"))
+                db.x("UPDATE clients SET created_by=? WHERE id=?", (me["user_id"], cid))
             except (OpError, runner.CtlError, ValueError) as ex:
-                return self.send(400, views.new_page(s, cfg["servers"], db.q("SELECT * FROM health"), str(ex)))
-            db.event(f"создан клиент «{f.get('name')}» ({sid}/{container})", self.ip)
-            self.redirect(f"/client/{cid}")
+                return self.send(400, views.new_page(me, visible_servers(me), visible_health(me), str(ex)))
+            self.event(me, f"создан клиент «{f.get('name')}» ({sid}/{container})", sid)
+            self.redirect(f"/client/{cid}?ok=created")
 
-        def action(self, s, cid, act, f):
+        def action(self, me, cid, act, f):
+            c = self.own_client(me, cid)
+            if not c:
+                return self.nf(me, "Нет такого клиента.")
+            label = c["name"] or c["pub"][:8]
             try:
-                c = service.get_client(db, cid)
-                label = c["name"] or c["pub"][:8]
                 if act == "disable":
                     service.disable(cfg, db, cid)
                 elif act == "enable":
@@ -282,29 +353,138 @@ def make_handler(app):
                     service.rename(cfg, db, cid, f.get("name"))
                 elif act == "migrate":
                     sid, container = (f.get("target") or "|").split("|", 1)
+                    if not access.can(cfg, me, sid):
+                        raise OpError("нет доступа к этому серверу")
                     new_id = service.migrate(cfg, db, cid, sid, container)
-                    db.event(f"«{label}» переведён на AWG 3.1 ({sid})", self.ip)
-                    return self.redirect(f"/client/{new_id}")
+                    db.x("UPDATE clients SET created_by=? WHERE id=?", (me["user_id"], new_id))
+                    self.event(me, f"клиент «{label}» переведён на AWG 3.1 ({sid})", sid)
+                    return self.redirect(f"/client/{new_id}?ok=created")
                 elif act == "share":
                     token = service.create_share(cfg, db, cid, f.get("hours"), f.get("one_time") == "1")
                     base = cfg.get("public_url") or f"https://{self.headers.get('Host', '')}"
-                    db.event(f"ссылка для «{label}»", self.ip)
-                    return self.client(s, cid, new_link=f"{base.rstrip('/')}/s/{token}")
+                    hours = f.get("hours") or cfg["share_ttl_hours"]
+                    kind = "одноразовая" if f.get("one_time") == "1" else "многоразовая"
+                    self.event(me, f"ссылка для «{label}» ({hours} ч, {kind})", c["server"])
+                    return self.client(me, cid, new_link=f"{base.rstrip('/')}/s/{token}")
             except (OpError, runner.CtlError, ValueError) as ex:
-                return self.client(s, cid, error=str(ex))
-            db.event(f"{ {'disable': 'отключён', 'enable': 'включён', 'delete': 'удалён', 'rename': 'переименован'}[act]} клиент «{label}»", self.ip)
+                return self.client(me, cid, error=str(ex))
+            words = {"disable": "отключён", "enable": "включён", "delete": "удалён", "rename": "переименован"}
+            self.event(me, f"{words[act]} клиент «{label}»", c["server"])
             self.redirect(f"/client/{cid}" if act != "delete" else "/")
+
+        def revoke(self, me, share_id):
+            s = db.one("SELECT client_id FROM shares WHERE id=?", (share_id,))
+            c = self.own_client(me, s["client_id"]) if s else None
+            if not c:
+                return self.nf(me)
+            service.revoke_share(db, share_id)
+            self.event(me, f"отозвана ссылка для «{c['name']}»", c["server"])
+            self.redirect(f"/client/{c['id']}")
 
         def share(self, token):
             c = service.open_share(db, token)
             if not c:
-                return self.send(404, views.not_found())
+                return self.send(404, views.link_invalid())
             try:
                 conf, kind = cached_config(cfg, db, c)
             except (OpError, runner.CtlError):
-                return self.send(503, views.not_found("Сервер временно недоступен, попробуйте позже."))
-            db.event(f"открыта ссылка клиента «{c['name']}»", self.ip)
+                return self.send(503, views.server_down())
+            db.event(f"открыта ссылка клиента «{c['name']}»", self.ip, None, c["server"])
             self.send(200, views.share_page(c, conf, kind, clientconf.qr_svg(conf)))
+
+        # ---- journal ----
+        def journal(self, me):
+            if access.is_owner(me):
+                where, args = "1=1", ()
+            else:
+                acc, acc_args = access.sql(cfg, me, "e.server")
+                where, args = f"({acc} OR e.user_id=?)", (*acc_args, me["user_id"])
+            events = db.q(f"""SELECT e.*, COALESCE(u.name, u.login) AS who FROM events e LEFT JOIN users u ON u.id=e.user_id
+                              WHERE {where} ORDER BY e.id DESC LIMIT 300""", args)
+            self.send(200, views.log_page(me, fmt, events))
+
+        # ---- profile ----
+        def profile(self, me, error="", ok=""):
+            user = db.one("SELECT * FROM users WHERE id=?", (me["user_id"],))
+            n = db.one("SELECT COUNT(*) n FROM sessions WHERE user_id=? AND expires>?", (me["user_id"], int(time.time())))["n"]
+            self.send(400 if error else 200, views.me_page(me, fmt, user, n, error, ok))
+
+        def profile_post(self, me, what, f):
+            if what == "password":
+                user = db.one("SELECT * FROM users WHERE id=?", (me["user_id"],))
+                if not auth.check_password(user["pw_hash"] or "", f.get("current", "")):
+                    return self.profile(me, error="Текущий пароль неверный.")
+                if f.get("password") != f.get("password2"):
+                    return self.profile(me, error="Новые пароли не совпали.")
+                try:
+                    auth.set_password(db, me["user_id"], f.get("password", ""), keep_token=self.cookie())
+                except ValueError as ex:
+                    return self.profile(me, error=f"Пароль не сменён: {ex}.")
+                self.event(me, "сменён свой пароль")
+                return self.profile(me, ok="Пароль сменён. Другие сеансы закрыты.")
+            if what == "profile":
+                try:
+                    accounts.rename_self(db, me, f.get("login"), f.get("name"))
+                except AccountError as ex:
+                    return self.profile(me, error=str(ex))
+                self.event(me, "изменены логин/имя в профиле")
+                return self.profile(auth.session(db, self.cookie()), ok="Сохранено.")
+            if what == "logout-others":
+                auth.logout_others(db, me["user_id"], keep_token=self.cookie())
+                self.event(me, "закрыты другие сеансы")
+                return self.profile(me, ok="Другие сеансы закрыты.")
+            self.nf(me)
+
+        # ---- accounts (owner) ----
+        def users(self, me, error="", ok="", invite_link="", invite_for=""):
+            users = db.q("SELECT * FROM users ORDER BY role DESC, login")
+            self.send(400 if error else 200, views.users_page(me, fmt, users, cfg["servers"], error, ok, invite_link, invite_for))
+
+        def user_form(self, me, uid, error="", invite_link=""):
+            try:
+                u = accounts.get(db, uid)
+            except AccountError:
+                return self.nf(me, "Нет такой учётки.")
+            self.send(400 if error else 200, views.user_form_page(me, fmt, u, cfg["servers"], error, invite_link))
+
+        def invite_url(self, token):
+            base = cfg.get("public_url") or f"https://{self.headers.get('Host', '')}"
+            return f"{base.rstrip('/')}/invite/{token}"
+
+        def users_post(self, me, path, f):
+            servers = self.multi.get("servers", [])
+            if path == "/users/new":
+                try:
+                    uid, token = accounts.create(cfg, db, me, f.get("login"), f.get("name"), f.get("role"), servers)
+                except AccountError as ex:
+                    return self.send(400, views.user_form_page(me, fmt, None, cfg["servers"], str(ex)))
+                self.event(me, f"создана учётка {f.get('login', '').strip().lower()} ({accounts.ROLES[f.get('role')]})")
+                return self.user_form(me, uid, invite_link=self.invite_url(token))
+            m = re.fullmatch(r"/users/(\d+)/(update|reset|disable|enable|delete)", path)
+            if not m:
+                return self.nf(me)
+            uid, act = int(m.group(1)), m.group(2)
+            try:
+                u = accounts.get(db, uid)
+                if act == "update":
+                    accounts.update(cfg, db, me, uid, f.get("name"), f.get("role"), servers)
+                    self.event(me, f"изменена учётка {u['login']}")
+                    return self.user_form(me, uid)
+                if act == "reset":
+                    token = accounts.reset(db, uid)
+                    self.event(me, f"сброшен пароль учётки {u['login']}")
+                    return self.user_form(me, uid, invite_link=self.invite_url(token))
+                if act in ("disable", "enable"):
+                    accounts.set_disabled(db, me, uid, act == "disable")
+                    self.event(me, f"учётка {u['login']} {'отключена' if act == 'disable' else 'включена'}")
+                    return self.user_form(me, uid)
+                if act == "delete":
+                    accounts.delete(db, me, uid)
+                    self.event(me, f"удалена учётка {u['login']}")
+                    return self.users(me, ok=f"Учётка {u['login']} удалена.")
+            except AccountError as ex:
+                return self.user_form(me, uid, error=str(ex))
+            self.nf(me)
 
     return H
 

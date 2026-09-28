@@ -114,18 +114,18 @@ d['servers']=s"
 
   cat > /usr/local/bin/vpn-panel-passwd <<EOF
 #!/bin/sh
-exec sudo -u $USER_ env PYTHONPATH=$PREFIX/panel:$PREFIX/panel/vendor VPN_PANEL_CONFIG=$ETC/config.json python3 -m vpnpanel set-password
+exec sudo -u $USER_ env PYTHONPATH=$PREFIX/panel:$PREFIX/panel/vendor VPN_PANEL_CONFIG=$ETC/config.json python3 -m vpnpanel set-password "\$@"
 EOF
   chmod 755 /usr/local/bin/vpn-panel-passwd
   install -m 644 "$PREFIX/deploy/vpn-panel.service" /etc/systemd/system/vpn-panel.service
   systemctl daemon-reload
   systemctl enable vpn-panel >/dev/null 2>&1
   if sudo -u $USER_ env PYTHONPATH=$PREFIX/panel VPN_PANEL_CONFIG=$ETC/config.json \
-      python3 -c 'from vpnpanel import config, db; c=config.load(); import sys; sys.exit(0 if db.DB(c["db"]).get("admin_password") else 1)'; then
+      python3 -c 'from vpnpanel import config, db; c=config.load(); import sys; d=db.DB(c["db"]); sys.exit(0 if d.one("SELECT 1 FROM users WHERE pw_hash IS NOT NULL") else 1)'; then
     systemctl restart vpn-panel
     say "panel is running: https://$endpoint:$port"
   else
-    say "set the admin password, then the panel starts:  vpn-panel-passwd && systemctl start vpn-panel"
+    say "set the owner password (login: admin), then the panel starts:  vpn-panel-passwd && systemctl start vpn-panel"
   fi
 }
 

@@ -1,7 +1,10 @@
 """python3 -m vpnpanel <command>
 
   serve                          run the web panel and the poller
-  set-password                   set the admin password (asks twice, or reads one line from stdin)
+  set-password [LOGIN]           set a password (default: the first owner; creates owner "admin" if none)
+  user list                      list accounts
+  user add LOGIN [--name N] [--role owner|admin] [--servers id,id]   create an account, print an invite link
+  user invite LOGIN              new one-time link to set the password (old password and sessions stop working)
   poll-once                      poll all servers once and print a summary (used by doctor.sh)
   import-client --server S --container C --conf FILE [--name N]
                                  attach an existing client config (with its private key) to the panel
@@ -13,8 +16,22 @@ import logging
 import sys
 import time
 
-from . import auth, config, keys, poller
+from . import accounts, auth, config, keys, poller
 from .db import DB
+
+
+def _read_password():
+    if sys.stdin.isatty():
+        p1, p2 = getpass.getpass("Пароль: "), getpass.getpass("Ещё раз: ")
+        if p1 != p2:
+            raise SystemExit("пароли не совпали")
+        return p1
+    return sys.stdin.readline().rstrip("\n")
+
+
+def _invite_url(cfg, token):
+    base = cfg.get("public_url") or f"https://<адрес панели>:{cfg['port']}"
+    return f"{base.rstrip('/')}/invite/{token}"
 
 
 def main(argv=None):
@@ -22,8 +39,18 @@ def main(argv=None):
     ap.add_argument("--config")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("serve")
-    sub.add_parser("set-password")
+    sp = sub.add_parser("set-password")
+    sp.add_argument("login", nargs="?")
     sub.add_parser("poll-once")
+    us = sub.add_parser("user").add_subparsers(dest="ucmd", required=True)
+    us.add_parser("list")
+    ua = us.add_parser("add")
+    ua.add_argument("login")
+    ua.add_argument("--name", default="")
+    ua.add_argument("--role", default="admin", choices=["owner", "admin"])
+    ua.add_argument("--servers", default="")
+    ui = us.add_parser("invite")
+    ui.add_argument("login")
     imp = sub.add_parser("import-client")
     imp.add_argument("--server", required=True)
     imp.add_argument("--container", required=True)
@@ -37,28 +64,57 @@ def main(argv=None):
 
     if a.cmd == "serve":
         from . import web
-        if not db.get("admin_password"):
-            print("admin password is not set: run `python3 -m vpnpanel set-password`", file=sys.stderr)
+        if not db.one("SELECT 1 FROM users WHERE pw_hash IS NOT NULL AND disabled=0"):
+            print("no account with a password: run `python3 -m vpnpanel set-password`", file=sys.stderr)
             return 1
         poller.start(cfg, db)
         web.serve(cfg, db)
         return 0
 
     if a.cmd == "set-password":
-        if sys.stdin.isatty():
-            p1, p2 = getpass.getpass("Пароль: "), getpass.getpass("Ещё раз: ")
-            if p1 != p2:
-                print("пароли не совпали", file=sys.stderr)
+        if a.login:
+            u = db.one("SELECT * FROM users WHERE login=?", (a.login.lower(),))
+            if not u:
+                print(f"нет учётки {a.login}", file=sys.stderr)
                 return 1
         else:
-            p1 = sys.stdin.readline().rstrip("\n")
-        if len(p1) < 10:
-            print("пароль короче 10 символов", file=sys.stderr)
+            u = db.one("SELECT * FROM users WHERE role='owner' ORDER BY id LIMIT 1")
+            if not u:
+                uid = db.x("INSERT INTO users(login, name, role, created) VALUES('admin', 'Владелец', 'owner', ?)",
+                           (int(time.time()),))
+                u = db.one("SELECT * FROM users WHERE id=?", (uid,))
+        try:
+            auth.set_password(db, u["id"], _read_password())
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
             return 1
-        db.set("admin_password", auth.hash_password(p1))
-        db.x("DELETE FROM sessions")
-        print("пароль установлен, все сессии сброшены")
+        db.x("UPDATE users SET disabled=0 WHERE id=?", (u["id"],))
+        print(f"пароль для «{u['login']}» установлен, его сессии сброшены")
         return 0
+
+    if a.cmd == "user":
+        me = {"user_id": None}
+        if a.ucmd == "list":
+            for u in db.q("SELECT * FROM users ORDER BY role DESC, login"):
+                state = "отключена" if u["disabled"] else ("ждёт пароль" if not u["pw_hash"] else "активна")
+                print(f"{u['login']:<20} {u['role']:<6} {state:<12} servers={u['servers'] or 'все'}  {u['name']}")
+            return 0
+        if a.ucmd == "add":
+            try:
+                _, token = accounts.create(cfg, db, me, a.login, a.name, a.role,
+                                           [s for s in a.servers.split(",") if s])
+            except accounts.AccountError as e:
+                print(str(e), file=sys.stderr)
+                return 1
+            print(_invite_url(cfg, token))
+            return 0
+        if a.ucmd == "invite":
+            u = db.one("SELECT * FROM users WHERE login=?", (a.login.lower(),))
+            if not u:
+                print(f"нет учётки {a.login}", file=sys.stderr)
+                return 1
+            print(_invite_url(cfg, accounts.reset(db, u["id"])))
+            return 0
 
     if a.cmd == "poll-once":
         summary = {}

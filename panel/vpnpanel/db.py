@@ -48,7 +48,30 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS logins (ts INTEGER NOT NULL, ip TEXT NOT NULL, ok INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS logins_ip ON logins (ip, ts);
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, ip TEXT, text TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY,
+  login TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL,                  -- 'owner' | 'admin'
+  pw_hash TEXT,                        -- NULL until the invite is used
+  servers TEXT,                        -- JSON list of server ids for admins; owners see everything
+  disabled INTEGER NOT NULL DEFAULT 0,
+  created INTEGER NOT NULL, created_by INTEGER, last_login INTEGER
+);
+CREATE TABLE IF NOT EXISTS invites (
+  id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, token_hash TEXT NOT NULL UNIQUE,
+  created INTEGER NOT NULL, expires INTEGER NOT NULL, used_at INTEGER
+);
 """
+
+# Columns added after the first release; created on start if missing (no data is lost).
+MIGRATIONS = [
+    ("sessions", "user_id", "INTEGER"),
+    ("logins", "login", "TEXT"),
+    ("events", "user_id", "INTEGER"),
+    ("events", "server", "TEXT"),
+    ("clients", "created_by", "INTEGER"),
+]
 
 
 class DB:
@@ -66,6 +89,21 @@ class DB:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
             self.conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self):
+        for table, col, decl in MIGRATIONS:
+            cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        # Single-password installs become an owner account "admin" with the same password hash.
+        if not self.conn.execute("SELECT 1 FROM users LIMIT 1").fetchone():
+            old = self.conn.execute("SELECT value FROM settings WHERE key='admin_password'").fetchone()
+            if old:
+                self.conn.execute("INSERT INTO users(login, name, role, pw_hash, created) VALUES('admin', 'Владелец', "
+                                  "'owner', ?, ?)", (old[0], int(time.time())))
+                self.conn.execute("DELETE FROM settings WHERE key='admin_password'")
+        self.conn.execute("DELETE FROM sessions WHERE user_id IS NULL")
 
     def q(self, sql, args=()):
         with self.lock:
@@ -106,5 +144,6 @@ class DB:
         self.x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                (key, value))
 
-    def event(self, text, ip=None):
-        self.x("INSERT INTO events(ts, ip, text) VALUES(?,?,?)", (int(time.time()), ip, text))
+    def event(self, text, ip=None, user_id=None, server=None):
+        self.x("INSERT INTO events(ts, ip, text, user_id, server) VALUES(?,?,?,?,?)",
+               (int(time.time()), ip, text, user_id, server))
