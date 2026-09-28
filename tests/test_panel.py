@@ -20,7 +20,7 @@ import urllib.parse
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path[:0] = [os.path.join(ROOT, "panel"), os.path.join(ROOT, "panel", "vendor")]
 
-from vpnpanel import auth, config, delivery, jobs, keys, poller, runner, servers, service, web  # noqa: E402
+from vpnpanel import alerts, auth, config, delivery, jobs, keys, limits, poller, runner, servers, service, web  # noqa: E402
 from vpnpanel.db import DB  # noqa: E402
 
 AGENT_PUB = keys.pubkey(keys.genkey())
@@ -675,6 +675,76 @@ class PanelTest(unittest.TestCase):
             self.assertIn("ok=approved", h["Location"])
         finally:
             delivery.tg_call = orig
+
+    def test_40_alerts_to_owner(self):
+        sent = []
+        orig = delivery.tg_call
+        delivery.tg_call = lambda tok, m, fields=None, files=None, timeout=30: sent.append((m, fields or {})) or {}
+        try:
+            self.db.set("tg_token", "123:X")
+            self.db.x("UPDATE users SET tg_chat_id=4242 WHERE login='admin'")
+            self.db.x("INSERT OR REPLACE INTO server_health(server, ok, checked, error) VALUES('usa', 0, ?, 'timeout')", (int(time.time()),))
+            alerts.evaluate(self.cfg, self.db)
+            self.assertEqual([x for x in sent if "🔴" in x[1].get("text", "")], [], "no alert inside the grace period")
+            self.db.x("UPDATE alerts SET since=since-300")
+            alerts.evaluate(self.cfg, self.db)
+            red = [x for x in sent if "🔴" in x[1].get("text", "")]
+            self.assertEqual(len(red), 1)
+            self.assertIn("США", red[0][1]["text"])
+            self.assertEqual(red[0][1]["chat_id"], 4242)
+            alerts.evaluate(self.cfg, self.db)
+            self.assertEqual(len([x for x in sent if "🔴" in x[1].get("text", "")]), 1, "sent once, not every poll")
+            self.db.x("UPDATE server_health SET ok=1 WHERE server='usa'")
+            alerts.evaluate(self.cfg, self.db)
+            self.assertTrue(any("✅" in x[1].get("text", "") and "США" in x[1]["text"] for x in sent))
+            # hourly: low disk
+            orig_pf = FAKES["fin"].run
+            FAKES["fin"].run = lambda args, stdin="": ({"version": "2", "free_mb": 120, "units": []} if args[0] == "preflight" else orig_pf(args, stdin))
+            try:
+                alerts.evaluate(self.cfg, self.db, hourly=True)
+                self.db.x("UPDATE alerts SET since=since-300")
+                alerts.evaluate(self.cfg, self.db)
+            finally:
+                FAKES["fin"].run = orig_pf
+            self.assertTrue(any("120 МБ" in x[1].get("text", "") for x in sent))
+            alerts.evaluate(self.cfg, self.db, hourly=True)
+        finally:
+            delivery.tg_call = orig
+            self.db.x("DELETE FROM settings WHERE key='tg_token'")
+
+    def test_41_expiry_and_quota(self):
+        token, csrf = self.login()
+        cid = self._new_client(token, csrf, "Лимитный", "fin|awg3", term="30", quota_gb="1")
+        c = self.db.one("SELECT * FROM clients WHERE id=?", (cid,))
+        self.assertGreater(c["expires"], time.time() + 29 * 86400)
+        self.assertEqual(c["quota_gb"], 1.0)
+        peers = FAKES["fin"].containers["awg3"]["peers"]
+        # expiry
+        self.db.x("UPDATE clients SET expires=? WHERE id=?", (int(time.time()) - 10, cid))
+        limits.enforce(self.cfg, self.db)
+        c = self.db.one("SELECT * FROM clients WHERE id=?", (cid,))
+        self.assertEqual((c["disabled"], c["auto_off"]), (1, "expired"))
+        self.assertTrue(peers[c["pub"]]["disabled"])
+        _, _, page = self.req("GET", "/", cookie=token)
+        self.assertIn("срок истёк", page)
+        _, _, page = self.req("POST", f"/client/{cid}/enable", {"csrf": csrf}, cookie=token)
+        self.assertIn("продлите", page, "manual enable refused while the limit still applies")
+        _, _, page = self.req("POST", f"/client/{cid}/limits", {"csrf": csrf, "extend": "30"}, cookie=token)
+        self.assertIn("снова включён", page)
+        self.assertFalse(peers[c["pub"]]["disabled"])
+        # quota: 2 GB used this month over a 1 GB limit
+        now = int(time.time())
+        self.db.x("INSERT OR REPLACE INTO traffic VALUES(?,?,?,?,?,?)", ("fin", "awg3", c["pub"], now - now % 3600, 2 * 1024 ** 3, 0))
+        limits.enforce(self.cfg, self.db)
+        self.assertEqual(self.db.one("SELECT auto_off FROM clients WHERE id=?", (cid,))["auto_off"], "quota")
+        _, _, page = self.req("GET", f"/client/{cid}", cookie=token)
+        self.assertIn("исчерпан лимит", page)
+        _, _, page = self.req("POST", f"/client/{cid}/limits", {"csrf": csrf, "expires": "", "quota_gb": "5", "quota_period": "month"}, cookie=token)
+        self.assertIn("снова включён", page)
+        c = self.db.one("SELECT * FROM clients WHERE id=?", (cid,))
+        self.assertEqual((c["disabled"], c["auto_off"], c["expires"], c["quota_gb"]), (0, None, None, 5.0))
+        _, _, page = self.req("POST", f"/client/{cid}/limits", {"csrf": csrf, "quota_gb": "-3"}, cookie=token)
+        self.assertIn("Не сохранено", page)
 
     def test_99_lockout_by_ip(self):
         # earlier tests already left a few failures from 127.0.0.1, so the block may come before the 5th try

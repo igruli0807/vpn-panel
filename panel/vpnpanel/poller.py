@@ -109,6 +109,12 @@ def start(cfg, db):
         while True:
             poll_all(cfg, db)
             n += 1
+            try:
+                from . import alerts, limits
+                limits.enforce(cfg, db)
+                alerts.evaluate(cfg, db, hourly=(n % 60 == 1))
+            except Exception:
+                log.exception("alerts/limits failed")
             if n % 60 == 1:
                 cleanup(cfg, db)
             time.sleep(cfg["poll_seconds"])

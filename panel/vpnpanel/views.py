@@ -177,6 +177,15 @@ def _tags(c):
         t.append('<span class="tag">удалён</span>')
     if c["protected"]:
         t.append('<span class="tag svc">служебный</span>')
+    if c.get("auto_off") == "expired":
+        t.append('<span class="tag red">срок истёк</span>')
+    elif c.get("auto_off") == "quota":
+        t.append('<span class="tag red">лимит</span>')
+    elif c.get("expires") and not c["deleted"]:
+        import time as _t
+        left = c["expires"] - _t.time()
+        if left < 7 * 86400:
+            t.append(f'<span class="tag">до {_t.strftime("%d.%m", _t.localtime(c["expires"]))}</span>')
     return f'<span class="tags">{"".join(t)}</span>' if t else ""
 
 
@@ -272,6 +281,9 @@ def new_page(me, servers, health, error=""):
 <fieldset class="field"><legend class="lb">Сервер и протокол</legend>{select}
 <span class="hint">AWG 3.1 — для Amnezia VPN 5.0.1.5+ и AmneziaWG 3.1; AWG 2.0 — для старых приложений.
 VLESS — клиенты Xray (v2rayNG, Hiddify, Streisand). SSTP — встроенный VPN Windows и MikroTik.</span></fieldset>
+<div class="row wrap"><div class="field grow"><label class="lb" for="trm">Срок</label><select id="trm" name="term" class="in tall">
+<option value="">без ограничения</option><option value="30">1 месяц</option><option value="90">3 месяца</option><option value="365">1 год</option></select></div>
+<div class="field"><label class="lb" for="nq">Лимит, ГБ в месяц</label><input id="nq" name="quota_gb" class="in tall port" inputmode="decimal" placeholder="без лимита"></div></div>
 <div class="field"><label class="lb" for="lgn">Логин для SSTP <span class="muted">(необязательно)</span></label>
 <input id="lgn" name="login" class="in tall" maxlength="32" autocapitalize="none" placeholder="придумается сам">
 <span class="hint">Только для SSTP: латиница, цифры, точка, дефис. Пароль панель сгенерирует.</span></div>
@@ -307,7 +319,7 @@ def chart(points, fmt):
 
 
 def client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets, protected,
-                error="", new_link="", notice="", selfsigned=True, send_html=""):
+                error="", new_link="", notice="", selfsigned=True, send_html="", used_bytes=0):
     conf = bundle["text"] if bundle else None
     now = int(time.time())
     title = c["name"] or "(без имени)"
@@ -359,11 +371,47 @@ def client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets, p
         mig = _migrate_form(me, c, targets) if targets and not c["migrated_to"] and kind in ("awg2", "legacy", "wireguard") else ""
         side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div><div class="pb">
 <p class="muted">Клиент создан в приложении Amnezia — его ключа в панели нет. Выдайте ему новый конфиг через «Перевести на AWG 3.1».</p>{mig}</div></section>""")
+    limits = limits_block(me, fmt, c, used_bytes) if (not c["deleted"] and not protected) else ""
     body = f"""<div class="head"><a class="btn txt back" href="/">← все клиенты</a>
 <div class="row gap12 wrap"><h1>{e(title)}</h1>{badge(kind)}<span class="{dot}" title="{st}"></span><span class="muted">{st}</span></div>{migrated}</div>
 {top_alerts}
-<div class="grid2"><div class="col">{facts}{traffic}{actions}</div><div class="col side">{''.join(side)}</div></div>"""
+<div class="grid2"><div class="col">{facts}{traffic}{limits}{actions}</div><div class="col side">{''.join(side)}</div></div>"""
     return layout(title, body, me, "clients")
+
+
+def limits_block(me, fmt, c, used_bytes):
+    import time as _t
+    now = int(_t.time())
+    GB = 1024 ** 3
+    exp = c.get("expires")
+    quota = c.get("quota_gb")
+    period = c.get("quota_period") or "month"
+    lines = []
+    if c.get("auto_off") == "expired":
+        lines.append('<div class="alert">' + I_WARN + '<div>Отключён автоматически: закончился срок. Продлите — и клиент включится сам.</div></div>')
+    elif c.get("auto_off") == "quota":
+        lines.append('<div class="alert">' + I_WARN + '<div>Отключён автоматически: исчерпан лимит трафика. Поднимите лимит'
+                     + (' или дождитесь нового месяца' if period == "month" else '') + '.</div></div>')
+    state = []
+    state.append(f"срок: до {fmt.dt(exp)}" + (" (истёк)" if exp and exp <= now else "") if exp else "срок: без ограничения")
+    if quota:
+        pct = min(100, int(used_bytes / (quota * GB) * 100)) if quota else 0
+        state.append(f"трафик: {used_bytes / GB:.1f} из {quota:g} ГБ {'в этом месяце' if period == 'month' else 'всего'} ({pct}%)")
+    else:
+        state.append("трафик: без лимита")
+    date_val = _t.strftime("%Y-%m-%d", _t.localtime(exp)) if exp else ""
+    popt = "".join(f'<option value="{v}"{" selected" if period == v else ""}>{t}</option>' for v, t in (("month", "в месяц"), ("total", "всего")))
+    quick = "".join(f'<form method="post" action="/client/{c["id"]}/limits">{csrf_field(me)}<input type="hidden" name="extend" value="{d}">'
+                    f'<button class="btn" type="submit">{t}</button></form>' for d, t in ((30, "+1 месяц"), (90, "+3 месяца")))
+    return f"""<section class="panel"><div class="ph"><h2>Срок и лимит</h2></div><div class="pb">{''.join(lines)}
+<p class="hint">{' · '.join(e(x) for x in state)}</p>
+<form class="row wrap" method="post" action="/client/{c['id']}/limits">{csrf_field(me)}
+<div class="field"><label class="lb" for="exp">До</label><input id="exp" name="expires" type="date" class="in" value="{e(date_val)}"></div>
+<div class="field"><label class="lb" for="qg">Лимит, ГБ</label><input id="qg" name="quota_gb" class="in port" inputmode="decimal" value="{e(f'{quota:g}' if quota else '')}" placeholder="без лимита"></div>
+<div class="field"><label class="lb" for="qp">Период</label><select id="qp" name="quota_period" class="in">{popt}</select></div>
+<div class="field"><span class="lb">&nbsp;</span><button class="btn pri" type="submit">Сохранить</button></div></form>
+<div class="row wrap">{quick}</div>
+<span class="hint">Пустые поля — без ограничения. Клиенту на связи с ботом придёт напоминание за 3 дня и при 90% лимита.</span></div></section>"""
 
 
 def _migrate_form(me, c, targets):

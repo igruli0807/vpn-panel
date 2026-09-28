@@ -98,6 +98,12 @@ MIGRATIONS = [
     ("clients", "tg_chat_id", "INTEGER"), # Telegram chat that pressed Start on this client's link
     ("clients", "email", "TEXT"),         # last address the config was mailed to
     ("users", "tg_chat_id", "INTEGER"),   # panel user's Telegram chat: request notifications + approve buttons
+    ("clients", "expires", "INTEGER"),    # access ends at (unix time); NULL = no limit
+    ("clients", "quota_gb", "REAL"),      # traffic limit in GB; NULL = unlimited
+    ("clients", "quota_period", "TEXT"),  # 'month' | 'total'
+    ("clients", "auto_off", "TEXT"),      # 'expired' | 'quota' when switched off by limits.py
+    ("clients", "warn_exp", "INTEGER"),   # expiry value already warned about
+    ("clients", "warn_quota", "TEXT"),    # quota period already warned about
 ]
 
 
@@ -170,6 +176,15 @@ class DB:
     def set(self, key, value):
         self.x("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                (key, value))
+
+    def get_json(self, key, default=None):
+        import json
+        v = self.get(key)
+        return json.loads(v) if v else default
+
+    def set_json(self, key, value):
+        import json
+        self.set(key, json.dumps(value, ensure_ascii=False))
 
     def event(self, text, ip=None, user_id=None, server=None):
         self.x("INSERT INTO events(ts, ip, text, user_id, server) VALUES(?,?,?,?,?)",

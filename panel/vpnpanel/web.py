@@ -9,7 +9,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import access, accounts, auth, clientconf, delivery, jobs, requests, runner, servers, service, views
+from . import access, accounts, auth, clientconf, delivery, jobs, limits, requests, runner, servers, service, views
 from .accounts import AccountError
 from .service import OpError
 
@@ -268,6 +268,9 @@ def make_handler(app):
                 m = re.fullmatch(r"/client/(\d+)/(disable|enable|delete|rename|share|migrate)", path)
                 if m:
                     return self.action(me, int(m.group(1)), m.group(2), f)
+                m = re.fullmatch(r"/client/(\d+)/limits", path)
+                if m:
+                    return self.limits_post(me, int(m.group(1)), f)
                 m = re.fullmatch(r"/client/(\d+)/(tg-link|tg-send|email)", path)
                 if m:
                     return self.deliver(me, int(m.group(1)), m.group(2), f)
@@ -393,8 +396,9 @@ def make_handler(app):
                         "title": f"{titles.get(h['server'], h['server'])} — AWG 3.1 (UDP {h['port']})"}
                        for h in visible_health(me) if h["kind"] == "awg3" and h["up"]]
             send_html = views.send_block(me, c, delivery_state(cfg, db, c), tg_link) if bundle else ""
+            used = limits.usage(cfg, db, c) if c.get("quota_gb") else 0
             self.send(200, views.client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets,
-                                             c["protected"], error, new_link, notice, selfsigned_url(cfg), send_html))
+                                             c["protected"], error, new_link, notice, selfsigned_url(cfg), send_html, used))
 
         def create(self, me, f):
             try:
@@ -403,6 +407,15 @@ def make_handler(app):
                     raise OpError("нет доступа к этому серверу")
                 cid = service.create_client(cfg, db, sid, container, f.get("name"), login=f.get("login"))
                 db.x("UPDATE clients SET created_by=? WHERE id=?", (me["user_id"], cid))
+                term = (f.get("term") or "").strip()
+                q = (f.get("quota_gb") or "").strip().replace(",", ".")
+                if term.isdigit() or q:
+                    exp = int(time.time()) + int(term) * 86400 if term.isdigit() else None
+                    try:
+                        quota = float(q) if q else None
+                    except ValueError:
+                        quota = None
+                    db.x("UPDATE clients SET expires=?, quota_gb=?, quota_period='month' WHERE id=?", (exp, quota, cid))
             except (OpError, runner.CtlError, ValueError) as ex:
                 return self.send(400, views.new_page(me, visible_servers(me), visible_health(me), str(ex)))
             self.event(me, f"создан клиент «{f.get('name')}» ({sid}/{container})", sid)
@@ -417,6 +430,8 @@ def make_handler(app):
                 if act == "disable":
                     service.disable(cfg, db, cid)
                 elif act == "enable":
+                    if c.get("auto_off"):
+                        raise OpError("клиент отключён по сроку или лимиту — продлите их в блоке «Срок и лимит», он включится сам")
                     service.enable(cfg, db, cid)
                 elif act == "delete":
                     service.delete(cfg, db, cid)
@@ -463,6 +478,38 @@ def make_handler(app):
             db.event(f"открыта ссылка клиента «{c['name']}»", self.ip, None, c["server"])
             qr = clientconf.qr_svg(bundle["qr"]) if bundle["qr"] else None
             self.send(200, views.share_page(c, bundle, kind, qr, clientconf.platform_of(self.headers.get("User-Agent"))))
+
+        # ---- limits ----
+        def limits_post(self, me, cid, f):
+            c = self.own_client(me, cid)
+            if not c or c["protected"]:
+                return self.nf(me, "Нет такого клиента.")
+            import datetime as _dt
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(cfg["timezone"])
+            try:
+                if f.get("extend"):
+                    days = int(f["extend"])
+                    base = max(c["expires"] or 0, int(time.time()))
+                    expires, quota, period = base + days * 86400, c["quota_gb"], c["quota_period"] or "month"
+                else:
+                    d = (f.get("expires") or "").strip()
+                    expires = (int(_dt.datetime.strptime(d, "%Y-%m-%d").replace(hour=23, minute=59, tzinfo=tz).timestamp())
+                               if d else None)
+                    q = (f.get("quota_gb") or "").strip().replace(",", ".")
+                    quota = float(q) if q else None
+                    if quota is not None and not 0 < quota < 100000:
+                        raise ValueError("лимит — число гигабайт больше нуля")
+                    period = f.get("quota_period") if f.get("quota_period") in ("month", "total") else "month"
+                back_on = limits.set_limits(cfg, db, c, expires, quota, period)
+            except ValueError as ex:
+                return self.client(me, cid, error=f"Не сохранено: {ex}")
+            except (OpError, runner.CtlError) as ex:
+                return self.client(me, cid, error=str(ex))
+            what = (f"срок до {fmt.dt(expires)}" if expires else "срок без ограничения") + ", " + (
+                f"лимит {quota:g} ГБ" if quota else "без лимита")
+            self.event(me, f"«{c['name']}»: {what}", c["server"])
+            return self.client(me, cid, notice="Сохранено." + (" Клиент снова включён." if back_on else ""))
 
         # ---- delivery ----
         def deliver(self, me, cid, act, f):
