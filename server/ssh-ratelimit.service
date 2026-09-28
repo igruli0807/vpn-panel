@@ -1,0 +1,12 @@
+[Unit]
+Description=Rate-limit new SSH connections (own chain SSH_LIMIT only)
+After=network-online.target docker.service netfilter-persistent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/ssh-ratelimit.sh
+
+[Install]
+WantedBy=multi-user.target
