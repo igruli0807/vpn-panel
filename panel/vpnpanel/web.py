@@ -801,12 +801,25 @@ def make_handler(app):
     return H
 
 
+class PanelServer(ThreadingHTTPServer):
+    daemon_threads = True
+    # scanners, plain http on the https port and clients that distrust the cert: one quiet line, no traceback
+    QUIET = (ssl.SSLError, TimeoutError, ConnectionError)
+
+    def handle_error(self, request, client_address):
+        import sys
+        ex = sys.exc_info()[1]
+        if isinstance(ex, self.QUIET):
+            log.debug("%s: %s", client_address[0], ex)
+            return
+        log.exception("request from %s failed", client_address[0])
+
+
 def serve(cfg, db):
     servers.refresh(cfg, db)
     jobs.reap(db)
     delivery.start_bot(cfg, db)
-    httpd = ThreadingHTTPServer((cfg["listen"], cfg["port"]), make_handler(App(cfg, db)))
-    httpd.daemon_threads = True
+    httpd = PanelServer((cfg["listen"], cfg["port"]), make_handler(App(cfg, db)))
     if cfg.get("tls_cert"):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2

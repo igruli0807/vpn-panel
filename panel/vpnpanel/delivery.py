@@ -382,7 +382,7 @@ def send_mail(db, to, subject, text, html_body=None, inline_png=None, attachment
     conn, sender = _smtp(db)
     msg = EmailMessage()
     msg["From"], msg["To"], msg["Subject"] = sender, to, subject
-    msg["Date"], msg["Message-ID"] = email.utils.formatdate(localtime=True), email.utils.make_msgid()
+    msg["Date"], msg["Message-ID"] = email.utils.formatdate(localtime=True), email.utils.make_msgid(domain=email.utils.parseaddr(sender)[1].rpartition("@")[2] or None)
     msg.set_content(text)
     if html_body:
         msg.add_alternative(html_body, subtype="html")

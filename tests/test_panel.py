@@ -820,5 +820,24 @@ class PanelTest(unittest.TestCase):
                          "correct password must be refused while the IP is blocked")
 
 
+class ServerLogTest(unittest.TestCase):
+    def test_tls_noise_is_quiet_real_errors_are_logged(self):
+        srv = web.PanelServer.__new__(web.PanelServer)
+        with self.assertLogs("vpnpanel.web", level="DEBUG") as cm:
+            try:
+                raise ssl.SSLError(1, "[SSL: SSLV3_ALERT_CERTIFICATE_UNKNOWN] alert")
+            except ssl.SSLError:
+                srv.handle_error(None, ("203.0.113.5", 1))
+            try:
+                raise ValueError("boom")
+            except ValueError:
+                srv.handle_error(None, ("203.0.113.6", 2))
+        quiet, loud = cm.records
+        self.assertEqual(quiet.levelname, "DEBUG")
+        self.assertIsNone(quiet.exc_info)
+        self.assertEqual(loud.levelname, "ERROR")
+        self.assertIsNotNone(loud.exc_info)
+
+
 if __name__ == "__main__":
     unittest.main()
