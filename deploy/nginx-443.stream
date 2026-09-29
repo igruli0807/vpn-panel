@@ -1,0 +1,32 @@
+# Panel on :443 next to another service that already owns the port (here: OpenVPN over TCP).
+# nginx only peeks at the first bytes (ssl_preread), it does not terminate TLS:
+#   TLS ClientHello        -> the panel (127.0.0.1:2053), with a PROXY line so the panel sees the real client IP
+#   anything else          -> the old service, moved to 127.0.0.1 (OpenVPN with tls-crypt is not TLS on the wire)
+# Panel config: "proxy_from": ["127.0.0.1"], "public_url": "https://<domain>".
+# Placeholders: @PUBLIC_IP@ — the server address, @FALLBACK@ — where non-TLS goes (e.g. 127.0.0.1:11194).
+# SoftEther on the same host re-binds 0.0.0.0:443/1194 the moment they are free: switch with vpnserver
+# stopped (stop vpnserver -> move the old service -> start nginx -> start vpnserver) and order
+# vpnserver After=nginx.service, or it takes :443 on the next boot.
+# Installed as /etc/nginx/stream.d/vpn-panel-443.conf; nginx.conf needs a top-level
+#   include /etc/nginx/stream.d/*.conf;
+stream {
+    map $ssl_preread_protocol $vp_backend {
+        ""      127.0.0.1:10443;   # not TLS -> fallback (via the PROXY-stripping hop below)
+        default 127.0.0.1:2053;    # TLS -> panel
+    }
+
+    server {
+        listen @PUBLIC_IP@:443;
+        ssl_preread on;
+        preread_timeout 10s;
+        proxy_protocol on;
+        proxy_connect_timeout 5s;
+        proxy_pass $vp_backend;
+    }
+
+    # the fallback service does not speak PROXY protocol: accept it here and pass plain bytes on
+    server {
+        listen 127.0.0.1:10443 proxy_protocol;
+        proxy_pass @FALLBACK@;
+    }
+}

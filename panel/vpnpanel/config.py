@@ -11,6 +11,8 @@ DEFAULTS = {
     "run_dir": "/run/vpn-panel",
     "timezone": "UTC",
     "public_url": "",
+    # peers allowed to prepend a PROXY v1 line (a local nginx stream in front, see deploy/nginx-443.stream)
+    "proxy_from": [],
     "share_ttl_hours": 72,
     "poll_seconds": 60,
     "online_seconds": 180,

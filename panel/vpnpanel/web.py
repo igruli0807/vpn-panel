@@ -3,6 +3,7 @@ import http.cookies
 import logging
 import os
 import re
+import socket
 import ssl
 import threading
 import time
@@ -802,9 +803,41 @@ def make_handler(app):
 
 
 class PanelServer(ThreadingHTTPServer):
+    """TLS is applied per connection in the handler thread (a slow client cannot stall accept()).
+    Connections from `proxy_from` (a local nginx/sslh in front, e.g. on :443) may start with a
+    PROXY protocol v1 line, so rate limits and the journal see the real client address."""
     daemon_threads = True
     # scanners, plain http on the https port and clients that distrust the cert: one quiet line, no traceback
     QUIET = (ssl.SSLError, TimeoutError, ConnectionError)
+
+    def __init__(self, addr, handler, ssl_ctx=None, proxy_from=()):
+        self.ssl_ctx, self.proxy_from = ssl_ctx, set(proxy_from)
+        super().__init__(addr, handler)
+
+    @staticmethod
+    def read_proxy_header(sock):
+        """Consume a PROXY v1 line if present -> (ip, port) or None."""
+        head = sock.recv(108, socket.MSG_PEEK)
+        end = head.find(b"\r\n")
+        if not head.startswith(b"PROXY ") or end < 0:
+            return None
+        sock.recv(end + 2)
+        parts = head[:end].decode("ascii", "replace").split(" ")
+        if len(parts) == 6 and parts[1] in ("TCP4", "TCP6"):
+            return parts[2], int(parts[4])
+        return None
+
+    def finish_request(self, request, client_address):
+        if client_address[0] in self.proxy_from:
+            request.settimeout(5)
+            client_address = self.read_proxy_header(request) or client_address
+        if self.ssl_ctx:
+            request = self.ssl_ctx.wrap_socket(request, server_side=True, do_handshake_on_connect=False)
+        try:
+            super().finish_request(request, client_address)
+        finally:
+            if self.ssl_ctx:
+                request.close()
 
     def handle_error(self, request, client_address):
         import sys
@@ -819,12 +852,12 @@ def serve(cfg, db):
     servers.refresh(cfg, db)
     jobs.reap(db)
     delivery.start_bot(cfg, db)
-    httpd = PanelServer((cfg["listen"], cfg["port"]), make_handler(App(cfg, db)))
+    ctx = None
     if cfg.get("tls_cert"):
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ctx.load_cert_chain(cfg["tls_cert"], cfg["tls_key"])
-        # handshake happens lazily in the handler thread, so a slow client cannot stall accept()
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+    httpd = PanelServer((cfg["listen"], cfg["port"]), make_handler(App(cfg, db)),
+                        ssl_ctx=ctx, proxy_from=cfg.get("proxy_from") or ())
     log.info("listening on %s:%s", cfg["listen"], cfg["port"])
     httpd.serve_forever()

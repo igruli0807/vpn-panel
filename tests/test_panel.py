@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -146,11 +147,9 @@ class PanelTest(unittest.TestCase):
         poller.runner.run = fake_run
         poller.poll_all(cls.cfg, cls.db)
 
-        from http.server import ThreadingHTTPServer
-        httpd = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(web.App(cls.cfg, cls.db)))
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(f"{cls.tmp}/tls.crt", f"{cls.tmp}/tls.key")
-        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True, do_handshake_on_connect=False)
+        httpd = web.PanelServer(("127.0.0.1", 0), web.make_handler(web.App(cls.cfg, cls.db)), ssl_ctx=ctx)
         cls.httpd = httpd
         cls.port = httpd.server_address[1]
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
@@ -837,6 +836,42 @@ class ServerLogTest(unittest.TestCase):
         self.assertIsNone(quiet.exc_info)
         self.assertEqual(loud.levelname, "ERROR")
         self.assertIsNotNone(loud.exc_info)
+
+
+class ProxyProtocolTest(unittest.TestCase):
+    def test_real_address_behind_local_proxy_over_tls(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp)
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-subj", "/CN=t",
+                        "-keyout", f"{tmp}/k", "-out", f"{tmp}/c"], check=True, capture_output=True)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(f"{tmp}/c", f"{tmp}/k")
+        seen = []
+
+        class Echo(web.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append(self.client_address[0])
+                self.send_response(204)
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        srv = web.PanelServer(("127.0.0.1", 0), Echo, ssl_ctx=ctx, proxy_from=["127.0.0.1"])
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            cctx = ssl._create_unverified_context()
+            for header in (b"PROXY TCP4 198.51.100.7 127.0.0.1 40000 443\r\n", b""):
+                raw = socket.create_connection(("127.0.0.1", port))
+                raw.sendall(header)
+                with cctx.wrap_socket(raw) as s:
+                    s.sendall(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                    self.assertIn(b"204", s.recv(100))
+            self.assertEqual(seen, ["198.51.100.7", "127.0.0.1"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
 if __name__ == "__main__":
