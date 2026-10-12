@@ -32,6 +32,9 @@
 
 **Пошагово, с нуля до выданного VPN: [docs/QUICKSTART.md](docs/QUICKSTART.md).**
 
+Офисный MikroTik, которому нужен VPN только для выбранных компьютеров и адресов:
+[docs/mikrotik-selective-vpn.md](docs/mikrotik-selective-vpn.md).
+
 Нужны Debian 12 / Ubuntu 22.04+, root, `python3` ≥ 3.9. Для VPN-сервера — Docker (поставится сам).
 
 ```bash
