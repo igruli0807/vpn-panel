@@ -10,7 +10,7 @@ avail=$(free -m | awk '/^Mem/{print $7}'); swap=$(free -m | awk '/^Swap/{print $
 [ "$avail" -ge 60 ] && ok "память: доступно ${avail} МБ, swap ${swap} МБ" || warn "память: доступно ${avail} МБ, swap ${swap} МБ"
 systemctl is-enabled netfilter-persistent >/dev/null 2>&1 && warn "включён netfilter-persistent — не делать 'netfilter-persistent save' при живых контейнерах (L0127)"
 
-if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^(awg3|amnezia-)'; then
+if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^(awg3|amnezia-|sstp$|xray$|telemt$|mtg-doppel$)'; then
   echo "VPN на этом хосте"
   command -v awgctl >/dev/null && ok "awgctl установлен" || bad "awgctl не установлен (./install.sh server --proto awg3)"
   systemctl is-active -q awg-guard.timer && ok "сторож awg-guard работает" || warn "сторож awg-guard не включён"
@@ -20,7 +20,10 @@ import json, sys
 for c in json.load(sys.stdin):
     mark = "✅" if c["up"] else "❌"
     tail = "" if c["up"] else " — ИНТЕРФЕЙС НЕ ПОДНЯТ"
-    print("  %s %s: %s, UDP %s, клиентов %s, отключено %s%s" % (mark, c["name"], c["kind"], c["port"], c["peers"], c["disabled"], tail))
+    tcp = c["kind"] in ("sstp", "vless", "telemt", "mtg")
+    if not c["up"] and tcp:
+        tail = " — НЕ РАБОТАЕТ"
+    print("  %s %s: %s, %s %s, клиентов %s, отключено %s%s" % (mark, c["name"], c["kind"], "TCP" if tcp else "UDP", c["port"], c["peers"], c["disabled"], tail))
 PY
   fi
 fi

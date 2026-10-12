@@ -114,6 +114,16 @@ def tg_send_client(cfg, db, c, chat_id):
         raise DeliveryError("бот не настроен")
     b = service.client_config(cfg, db, c)
     name = html.escape(c.get("name") or "VPN")
+    if b["kind"] in service.TG_KINDS:
+        # the link is tappable right in the chat; the QR is for another device
+        tg_call(token, "sendMessage", {"chat_id": chat_id, "parse_mode": "HTML", "disable_web_page_preview": "true",
+                                       "text": f"🔐 <b>Прокси для Telegram: {name}</b>\n\nНажмите на ссылку и выберите "
+                                               f"«Подключить прокси»:\n{html.escape(b['text'])}\n\n"
+                                               "Это прокси только для Telegram, остальные приложения идут как обычно."})
+        tg_call(token, "sendPhoto", {"chat_id": chat_id, "caption": "QR — для другого устройства"},
+                {"photo": ("qr.png", clientconf.qr_png(b["qr"]), "image/png")})
+        tg_call(token, "sendMessage", {"chat_id": chat_id, "text": "Ссылка — ваш доступ к прокси, не пересылайте её."})
+        return
     intro = f"🔐 <b>Ваш VPN: {name}</b>\n\n1. Установите приложение:\n{_apps_text(b['kind'])}\n\n"
     if b["kind"] == "sstp":
         fields = "\n".join(f"{html.escape(k)}: <code>{html.escape(v)}</code>" for k, v in b["fields"])
@@ -412,6 +422,21 @@ def mail_client(cfg, db, c, to):
                         ", ".join(f'<a href="{html.escape(u)}">{html.escape(n)}</a>' for n, u, _, _ in links[pid][:3]) + "</p>"
                         for pid, title in clientconf.PLATFORMS)
     attachments, png = [], None
+    if b["kind"] in service.TG_KINDS:
+        png = clientconf.qr_png(b["qr"])
+        link = html.escape(b["text"])
+        text = (f"Прокси для Telegram: {name}\n\n1. Нужен только сам Telegram:\n{apps_txt}\n\n"
+                f"2. Откройте ссылку на устройстве с Telegram и нажмите «Подключить прокси»:\n{b['text']}\n\n"
+                "Это прокси только для Telegram. Ссылка — ваш доступ к нему, не пересылайте её.\n")
+        html_body = (f"<h2>Прокси для Telegram: {html.escape(name)}</h2><p>1. Нужен только сам Telegram:</p>{apps_html}"
+                     f"<p>2. Откройте ссылку на устройстве с Telegram и нажмите «Подключить прокси» "
+                     f"(или отсканируйте QR камерой телефона):</p><p><a href=\"{link}\">{link}</a></p>"
+                     '<p><img src="cid:qr" alt="QR" width="260" height="260"></p>'
+                     "<p style=\"color:#666\">Это прокси только для Telegram. Ссылка — ваш доступ к нему, "
+                     "не пересылайте её.</p>")
+        send_mail(db, to, f"Прокси для Telegram: {name}", text, html_body, png, attachments)
+        db.x("UPDATE clients SET email=? WHERE id=?", (to, c["id"]))
+        return
     if b["kind"] == "sstp":
         body_txt = "\n".join(f"{k}: {v}" for k, v in b["fields"])
         body_html = "<table>" + "".join(f"<tr><td>{html.escape(k)}</td><td><code>{html.escape(v)}</code></td></tr>"

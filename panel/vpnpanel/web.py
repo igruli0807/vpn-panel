@@ -675,10 +675,10 @@ def make_handler(app):
                             raise servers.ServerError("порт — число от 1 до 65535")
                         args += ["--port", port]
                     sni = (f.get("sni") or "").strip()
-                    if proto == "vless" and sni:
+                    if proto in servers.SNI_PROTOCOLS and sni:
                         if not servers.HOST_RE.match(sni):
-                            raise servers.ServerError("неверный SNI")
-                        args += ["--sni", sni]
+                            raise servers.ServerError("неверное имя сайта (SNI)")
+                        args += ["--sni", sni.lower()]
                     title = f"Установка {servers.PROTOCOLS[proto]} на «{srv['title']}»"
                 else:
                     if servers.UNIT_OF[proto] in protected_units(cfg, db).get(sid, set()):

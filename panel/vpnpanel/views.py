@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from .service import CAN_ADD, KIND_TITLE
+from .service import CAN_ADD, KIND_TITLE, SHARED_UNITS, TCP_KINDS, TG_KINDS
 
 
 def e(v):
@@ -64,7 +64,8 @@ I_USER = _svg(16, 2, '<circle cx="12" cy="8" r="4"></circle><path d="M4 21c1.5-4
 I_LINKOFF = _svg(40, 1.8, '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"></path>'
                           '<path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"></path><path d="M4 4l16 16"></path>')
 
-BADGE = {"awg3": "b-awg3", "awg2": "b-awg2", "legacy": "b-legacy", "wireguard": "b-wg", "sstp": "b-sstp", "vless": "b-vless"}
+BADGE = {"awg3": "b-awg3", "awg2": "b-awg2", "legacy": "b-legacy", "wireguard": "b-wg", "sstp": "b-sstp", "vless": "b-vless",
+         "telemt": "b-tg", "mtg": "b-tg"}
 KIND_TITLE_ALL = dict(KIND_TITLE, sstp="SSTP", vless="VLESS")
 
 
@@ -212,7 +213,7 @@ def dashboard(me, fmt, servers, health, server_health, clients, filters, now):
         cards.append(f"""<a class="{cls}" href="/?server={e(h['server'])}&amp;container={e(h['container'])}">
 <div class="top"><span class="small muted">{e(titles.get(h['server'], h['server']))}</span>{badge(h['kind'])}</div>
 <div class="big">{on} <small>в сети из {h['peers']}</small></div>
-<div class="top"><span class="mono muted">{"TCP" if h["kind"] in ("sstp", "vless") else "UDP"} {e(h['port'])}</span><span class="st">{state}</span></div></a>""")
+<div class="top"><span class="mono muted">{"TCP" if h["kind"] in TCP_KINDS else "UDP"} {e(h['port'])}</span><span class="st">{state}</span></div></a>""")
     sopt = '<option value="">Все серверы</option>' + "".join(
         f'<option value="{e(s["id"])}"{" selected" if filters["server"] == s["id"] else ""}>{e(s.get("title", s["id"]))}</option>'
         for s in servers)
@@ -262,10 +263,10 @@ def dashboard(me, fmt, servers, health, server_health, clients, filters, now):
 def new_page(me, servers, health, error=""):
     titles = {s["id"]: s.get("title", s["id"]) for s in servers}
     opts = []
-    order = {"awg3": 0, "vless": 1, "awg2": 2, "sstp": 3}
+    order = {"awg3": 0, "vless": 1, "awg2": 2, "sstp": 3, "telemt": 4}
     for h in sorted(health, key=lambda h: (order.get(h["kind"], 9), h["server"])):
         if h["kind"] in CAN_ADD and h["server"] in titles:
-            proto = "TCP" if h["kind"] in ("sstp", "vless") else "UDP"
+            proto = "TCP" if h["kind"] in TCP_KINDS else "UDP"
             label = " (системный)" if h["container"] == "sstp-host" else ""
             opts.append(f'<option value="{e(h["server"])}|{e(h["container"])}">'
                         f'{e(titles[h["server"]])} — {e(KIND_TITLE[h["kind"]])}{label} ({proto} {e(h["port"])})</option>')
@@ -280,13 +281,14 @@ def new_page(me, servers, health, error=""):
 <span class="hint">До 64 символов. Видно только в панели.</span></div>
 <fieldset class="field"><legend class="lb">Сервер и протокол</legend>{select}
 <span class="hint">AWG 3.1 — для Amnezia VPN 5.0.1.5+ и AmneziaWG 3.1; AWG 2.0 — для старых приложений.
-VLESS — клиенты Xray (v2rayNG, Hiddify, Streisand). SSTP — встроенный VPN Windows и MikroTik.</span></fieldset>
+VLESS — клиенты Xray (v2rayNG, Hiddify, Streisand). SSTP — встроенный VPN Windows и MikroTik.
+Telegram · telemt — не VPN, а прокси только для Telegram: клиент получит ссылку, которая открывается в самом Telegram.</span></fieldset>
 <div class="row wrap"><div class="field grow"><label class="lb" for="trm">Срок</label><select id="trm" name="term" class="in tall">
 <option value="">без ограничения</option><option value="30">1 месяц</option><option value="90">3 месяца</option><option value="365">1 год</option></select></div>
 <div class="field"><label class="lb" for="nq">Лимит, ГБ в месяц</label><input id="nq" name="quota_gb" class="in tall port" inputmode="decimal" placeholder="без лимита"></div></div>
-<div class="field"><label class="lb" for="lgn">Логин для SSTP <span class="muted">(необязательно)</span></label>
+<div class="field"><label class="lb" for="lgn">Логин для SSTP и Telegram-прокси <span class="muted">(необязательно)</span></label>
 <input id="lgn" name="login" class="in tall" maxlength="32" autocapitalize="none" placeholder="придумается сам">
-<span class="hint">Только для SSTP: латиница, цифры, точка, дефис. Пароль панель сгенерирует.</span></div>
+<span class="hint">Только для SSTP и Telegram · telemt: латиница, цифры, точка, дефис. Пароль или секрет панель сгенерирует.</span></div>
 <button class="btn pri tall" type="submit"{'' if opts else ' disabled'}>Создать</button>
 <span class="hint">После создания сразу откроется карточка с QR-кодом.</span>
 </div></form>"""
@@ -332,12 +334,12 @@ def client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets, p
     migrated = (f'<p>Переехал: <a href="/client/{c["migrated_to"]}">новый клиент</a></p>' if c["migrated_to"] else "")
     facts = f"""<section class="panel"><div class="ph"><h2>Сведения</h2></div><div class="pb"><dl class="dl">
 <dt>Сервер и протокол</dt><dd>{e(server.get('title', server['id']))} · {e(KIND_TITLE_ALL.get(kind or '', c['container']))}</dd>
-<dt>IP в VPN</dt><dd class="mono">{e(c['ip'])}</dd>
+{'' if kind in TG_KINDS else f'<dt>IP в VPN</dt><dd class="mono">{e(c["ip"])}</dd>'}
 <dt>Статус</dt><dd class="row"><span class="{dot}"></span>{st}</dd>
 <dt>Последнее подключение</dt><dd>{e(fmt.dt(c['hs']))} <span class="muted">· {e(fmt.ago(c['hs'], now))}</span></dd>
 <dt>Откуда</dt><dd class="mono">{e(c['endpoint'] or '—')}</dd>
 <dt>Трафик</dt><dd class="num">{e(fmt.size(c['d1']))} <span class="muted">24 ч</span> · {e(fmt.size(c['d30']))} <span class="muted">30 дн</span> · {e(fmt.size(c['dall']))} <span class="muted">всего</span></dd>
-<dt>Создан</dt><dd>{e(fmt.dt(c['created']))} <span class="muted">· {'в панели' if c['source'] == 'panel' else 'в приложении Amnezia'}</span></dd>
+<dt>Создан</dt><dd>{e(fmt.dt(c['created']))} <span class="muted">· {'в панели' if c['source'] == 'panel' else 'на сервере' if kind in TG_KINDS else 'в приложении Amnezia'}</span></dd>
 </dl></div></section>"""
     svg, top = chart(points, fmt)
     traffic = f"""<section class="panel"><div class="ph"><h2>Трафик за 7 дней</h2><span class="sp"></span>
@@ -346,6 +348,12 @@ def client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets, p
     acts = []
     if protected:
         acts.append('<p class="muted">Служебный пир (туннель администратора) — изменения из панели запрещены.</p>')
+    elif not c["deleted"] and c["container"] in SHARED_UNITS:
+        acts.append(f"""<form class="field" method="post" action="/client/{c['id']}/rename">{csrf_field(me)}
+<label class="lb" for="rn">Имя</label><div class="row"><input id="rn" name="name" class="in grow" value="{e(c['name'])}" maxlength="64">
+<button class="btn" type="submit">Переименовать</button></div></form>
+<p class="hint">У этого прокси одна ссылка на всех, отдельных пользователей нет: счётчика трафика и отключения по одному
+не бывает. Чтобы отозвать ссылку, удалите протокол на странице «Серверы» и установите заново — секрет сменится.</p>""")
     elif not c["deleted"]:
         acts.append(f"""<form class="field" method="post" action="/client/{c['id']}/rename">{csrf_field(me)}
 <label class="lb" for="rn">Имя</label><div class="row"><input id="rn" name="name" class="in grow" value="{e(c['name'])}" maxlength="64">
@@ -362,16 +370,20 @@ def client_page(me, fmt, c, server, bundle, kind, qr, shares, points, targets, p
 
     side = []
     if bundle:
-        side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div>{config_block(bundle, kind, qr, c)}
+        side.append(f"""<section class="panel"><div class="ph"><h2>{'Ссылка для Telegram' if kind in TG_KINDS else 'Конфиг'}</h2></div>{config_block(bundle, kind, qr, c)}
 <div class="pb apps-pb"><div class="lb">Приложения для клиента</div>{apps_block(kind, "android", compact=True)}</div></section>""")
         if send_html:
             side.append(send_html)
         side.append(_share_block(me, fmt, c, shares, new_link, now, selfsigned))
     elif not c["deleted"] and not protected:
         mig = _migrate_form(me, c, targets) if targets and not c["migrated_to"] and kind in ("awg2", "legacy", "wireguard") else ""
+        why = ("Этот пользователь прокси создан не в панели — его секрета здесь нет. Создайте нового клиента на этом прокси "
+               "и выдайте ссылку ему." if kind in TG_KINDS else
+               "Клиент создан в приложении Amnezia — его ключа в панели нет. Выдайте ему новый конфиг через «Перевести на AWG 3.1».")
         side.append(f"""<section class="panel"><div class="ph"><h2>Конфиг</h2></div><div class="pb">
-<p class="muted">Клиент создан в приложении Amnezia — его ключа в панели нет. Выдайте ему новый конфиг через «Перевести на AWG 3.1».</p>{mig}</div></section>""")
-    limits = limits_block(me, fmt, c, used_bytes) if (not c["deleted"] and not protected) else ""
+<p class="muted">{why}</p>{mig}</div></section>""")
+    limits = limits_block(me, fmt, c, used_bytes) if (not c["deleted"] and not protected
+                                                      and c["container"] not in SHARED_UNITS) else ""
     body = f"""<div class="head"><a class="btn txt back" href="/">← все клиенты</a>
 <div class="row gap12 wrap"><h1>{e(title)}</h1>{badge(kind)}<span class="{dot}" title="{st}"></span><span class="muted">{st}</span></div>{migrated}</div>
 {top_alerts}
@@ -512,6 +524,12 @@ def config_block(b, kind, qr, c, public=False):
         btns = [f'<button class="btn{" pri" if not b.get("cert_pem") else ""}{big}" type="button" data-copy="conf">Копировать всё</button>']
         if b.get("cert_pem"):
             btns.insert(0, f'<a class="btn pri{big}" download="{e(b["cert_name"])}" href="{_data_url(b["cert_pem"], "application/x-x509-ca-cert")}">Скачать сертификат</a>')
+    elif b["kind"] in TG_KINDS:
+        parts.append('<p class="hint c">Откройте ссылку на устройстве с Telegram — он сам предложит включить прокси. '
+                     'С другого устройства отсканируйте QR камерой телефона.</p>')
+        parts.append(f'<div class="uri mono">{e(b["text"])}</div>')
+        btns = [f'<a class="btn pri{big}" href="{e(b["text"])}" target="_blank" rel="noopener noreferrer">Открыть в Telegram</a>',
+                f'<button class="btn{big if public else ""}" type="button" data-copy="conf">Копировать ссылку</button>']
     elif b["kind"] == "vless":
         parts.append(f'<p class="hint c">Отсканируйте QR или скопируйте ссылку и вставьте в приложение («+» → «Импорт из буфера»).</p>')
         parts.append(f'<div class="uri mono">{e(b["text"])}</div>')
@@ -529,6 +547,16 @@ def share_page(c, b, kind, qr, platform="desktop"):
     step2 = {"sstp": "Создайте VPN-подключение типа SSTP с данными ниже.",
              "vless": "В приложении нажмите «+» и выберите «Сканировать QR» или «Импорт из буфера».",
              }.get(b["kind"], "В приложении нажмите «+» и выберите «QR-код» или «Файл».")
+    if b["kind"] in TG_KINDS:
+        return bare("Прокси для Telegram", f"""<div class="pubwrap"><main class="pub">
+<div class="head"><h1>Прокси для Telegram</h1><p class="muted">Подключение для: <strong>{e(c['name'])}</strong></p></div>
+<ol class="steps">
+<li><span class="n">1</span><div class="grow">Нужен только сам Telegram:{apps_block(kind, platform)}</div></li>
+<li><span class="n">2</span><div>Нажмите «Открыть в Telegram» на устройстве, где он установлен, или отсканируйте QR камерой телефона.</div></li>
+<li><span class="n">3</span><div>В Telegram нажмите «Подключить прокси».</div></li></ol>
+{config_block(b, kind, qr, c, public=True)}
+<p class="small muted">Ссылка — ваш доступ к прокси, не пересылайте её. Страница может быть одноразовой: сохраните ссылку сейчас.</p>
+</main></div>""")
     return bare("Ваш VPN", f"""<div class="pubwrap"><main class="pub">
 <div class="head"><h1>Ваш VPN</h1><p class="muted">Подключение для: <strong>{e(c['name'])}</strong></p></div>
 <ol class="steps">
@@ -780,8 +808,11 @@ def _tg_admin_block(me, st, link):
 
 # ---------- servers (owner) ----------
 
-PROTO_TITLE = {"awg3": "AWG 3.1", "sstp": "SSTP", "vless": "VLESS"}
-UNIT_PROTO = {"awg3": "awg3", "sstp": "sstp", "xray": "vless"}
+PROTO_TITLE = {"awg3": "AWG 3.1", "sstp": "SSTP", "vless": "VLESS",
+               "telemt": "Telegram-прокси telemt", "mtg": "Telegram-прокси mtg"}
+UNIT_PROTO = {"awg3": "awg3", "sstp": "sstp", "xray": "vless", "telemt": "telemt", "mtg-doppel": "mtg"}
+# Telegram proxies: default port and the site they pretend to be (both can be changed in the install form)
+TG_DEFAULTS = {"telemt": ("443", "www.samsung.com"), "mtg": ("9443", "www.intel.com")}
 
 
 def servers_page(me, fmt, servers, health, server_health, jobs_running, protected_units, error="", ok=""):
@@ -806,7 +837,7 @@ def servers_page(me, fmt, servers, health, server_health, jobs_running, protecte
                 rm = '<span class="small muted">служебный туннель — удалять нельзя</span>'
             label = " (системный accel-ppp)" if h["container"] == "sstp-host" else ""
             rows.append(f"""<tr><td>{badge(h['kind'])}{e(label)}</td><td class="mono">{e(h['container'])}</td>
-<td class="mono">{"TCP" if h["kind"] in ("sstp", "vless") else "UDP"} {e(h['port'])}</td>
+<td class="mono">{"TCP" if h["kind"] in TCP_KINDS else "UDP"} {e(h['port'])}</td>
 <td>{'<span class="tag acc">работает</span>' if h['up'] else '<span class="tag red">не поднят</span>'}</td><td class="r">{h['peers']}</td><td class="r">{rm}</td></tr>""")
         installed = {UNIT_PROTO.get(h["container"]) for h in units}
         running = jobs_running.get(s["id"])
@@ -818,9 +849,18 @@ def servers_page(me, fmt, servers, health, server_health, jobs_running, protecte
                 if proto in installed:
                     continue
                 sni = ('<input name="sni" class="in" placeholder="SNI (авто)" aria-label="SNI для REALITY">' if proto == "vless" else "")
+                port_hint = "порт (авто)"
+                if proto in TG_DEFAULTS:
+                    port_hint = f"порт ({TG_DEFAULTS[proto][0]})"
+                    sni = (f'<input name="sni" class="in" placeholder="сайт маскировки ({TG_DEFAULTS[proto][1]})" '
+                           f'aria-label="Сайт, под который маскируется прокси">')
                 installs.append(f"""<form class="row wrap" method="post" action="/servers/{e(s['id'])}/install">{csrf_field(me)}
-<input type="hidden" name="proto" value="{proto}"><input name="port" class="in port" placeholder="порт (авто)" inputmode="numeric" aria-label="Порт">{sni}
+<input type="hidden" name="proto" value="{proto}"><input name="port" class="in port" placeholder="{port_hint}" inputmode="numeric" aria-label="Порт">{sni}
 <button class="btn" type="submit">Установить {e(title)}</button></form>""")
+            if any(p not in installed for p in TG_DEFAULTS):
+                installs.append('<p class="hint">Telegram-прокси — не VPN: через него работает только Telegram. Посторонним порт '
+                                'отдаёт настоящий сайт маскировки. telemt — у каждого клиента своя ссылка, её можно отключить; '
+                                'mtg — одна общая ссылка на всех.</p>')
         facts = []
         if info:
             facts.append(f"vpnctl {e(info.get('version', '?'))} · {e(info.get('os', ''))} · свободно {e(info.get('free_mb'))} МБ · памяти {e(info.get('mem_avail_mb'))} МБ"

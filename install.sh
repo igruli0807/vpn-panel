@@ -5,9 +5,10 @@
 #       install the web panel on this host (and register this host's VPN containers, if any)
 #   ./install.sh add-server --id usa --title "США" --host IP [--ssh-port 22] [--endpoint IP]
 #       run on the panel host: connect another VPN server (uses your root SSH access once)
-#   ./install.sh server --proto awg3|sstp|vless [--port N] [--sni HOST]
-#       run on a VPN host: install a protocol in docker (awg3 / sstp / xray container) + vpnctl
-#   ./install.sh server --remove --proto awg3|sstp|vless
+#   ./install.sh server --proto awg3|sstp|vless|telemt|mtg [--port N] [--sni HOST]
+#       run on a VPN host: install a protocol in docker (awg3 / sstp / xray container) + vpnctl;
+#       telemt and mtg are Telegram proxies (upstream images pinned by digest), --sni = the site they pretend to be
+#   ./install.sh server --remove --proto awg3|sstp|vless|telemt|mtg
 #   Servers can also be added and protocols installed from the panel UI («Серверы»).
 #   ./install.sh domain --name vpn.example.com
 #       Let's Encrypt certificate for the panel / SSTP / mail (acme.sh, auto-renewal); the domain must point here
@@ -27,6 +28,8 @@ ETC=/etc/vpn-panel
 LIB=/var/lib/vpn-panel
 USER_=vpnpanel
 declare -A IMAGE_OF=([awg3]="awg3:3.1.20260828" [sstp]="sstp:1.14.0" [vless]="xray:26.3.27")
+# Telegram proxies: vpnctl pulls the upstream images itself (pinned by digest), nothing is built here.
+UPSTREAM_PROTOS=" telemt mtg "
 GHCR=${VPN_PANEL_GHCR:-ghcr.io/igruli0807}
 
 say() { echo -e "\033[1m[vpn-panel]\033[0m $*"; }
@@ -112,7 +115,7 @@ PY
   fi
 
   # This host runs VPN containers too -> manage them locally through sudo vpnctl.
-  if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^(awg3|sstp|xray|amnezia-(awg2?|wireguard))$' \
+  if command -v docker >/dev/null && docker ps --format '{{.Names}}' | grep -qE '^(awg3|sstp|xray|telemt|mtg-doppel|amnezia-(awg2?|wireguard))$' \
      || systemctl is-active --quiet accel-ppp 2>/dev/null; then
     install_vpnctl; command -v docker >/dev/null && install_guard
     id=${id:-$(hostname -s)}; title=${title:-$id}
@@ -183,7 +186,7 @@ cmd_server() {
   while [ $# -gt 0 ]; do case "$1" in
     --proto) proto=$2; shift 2 ;; --remove) remove=1; shift ;; --port) port=$2; shift 2 ;; --sni) sni=$2; shift 2 ;;
     *) die "unknown option $1" ;; esac; done
-  [ -n "${IMAGE_OF[$proto]:-}" ] || die "--proto awg3|sstp|vless is required"
+  [ -n "${IMAGE_OF[$proto]:-}" ] || [[ "$UPSTREAM_PROTOS" == *" $proto "* ]] || die "--proto awg3|sstp|vless|telemt|mtg is required"
   sync_code
   install_vpnctl
   if [ "$remove" = 1 ]; then
@@ -191,8 +194,8 @@ cmd_server() {
     return
   fi
   command -v docker >/dev/null || { say "installing docker"; apt-get update -qq && apt-get install -y -qq docker.io >/dev/null; }
-  local image=${IMAGE_OF[$proto]} name=${IMAGE_OF[$proto]%%:*}
-  if ! docker image inspect "$image" >/dev/null 2>&1; then
+  local image=${IMAGE_OF[$proto]:-} name=${IMAGE_OF[$proto]:-}; name=${name%%:*}
+  if [ -n "$image" ] && ! docker image inspect "$image" >/dev/null 2>&1; then
     if docker pull -q "$GHCR/$image" >/dev/null 2>&1; then
       docker tag "$GHCR/$image" "$image"
     else
