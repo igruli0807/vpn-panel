@@ -22,8 +22,11 @@ ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,23}$")
 HOST_RE = re.compile(r"^[A-Za-z0-9.:-]{1,253}$")
 SERVER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "server")
 BUNDLE = ("vpnctl", "install-awg3.sh", "awg-guard.sh", "awg-guard.service", "awg-guard.timer")
-PROTOCOLS = {"awg3": "AWG 3.1", "sstp": "SSTP", "vless": "VLESS"}
-UNIT_OF = {"awg3": "awg3", "sstp": "sstp", "vless": "xray"}
+PROTOCOLS = {"awg3": "AWG 3.1", "sstp": "SSTP", "vless": "VLESS",
+             "telemt": "Telegram-прокси telemt", "mtg": "Telegram-прокси mtg"}
+UNIT_OF = {"awg3": "awg3", "sstp": "sstp", "vless": "xray", "telemt": "telemt", "mtg": "mtg-doppel"}
+# Protocols whose install takes "--sni": the REALITY target (vless) or the site a Telegram proxy pretends to be.
+SNI_PROTOCOLS = {"vless", "telemt", "mtg"}
 
 
 class ServerError(Exception):

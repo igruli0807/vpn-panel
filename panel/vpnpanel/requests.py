@@ -9,8 +9,8 @@ import time
 
 from . import access, service
 
-KIND_LABEL = {"awg3": "AWG 3.1", "awg2": "AWG 2.0", "vless": "VLESS", "sstp": "SSTP"}
-ORDER = {"awg3": 0, "vless": 1, "awg2": 2, "sstp": 3}
+KIND_LABEL = {"awg3": "AWG 3.1", "awg2": "AWG 2.0", "vless": "VLESS", "sstp": "SSTP", "telemt": "Прокси для Telegram"}
+ORDER = {"awg3": 0, "vless": 1, "awg2": 2, "sstp": 3, "telemt": 4}
 MAX_PENDING = 50
 REJECT_COOLDOWN = 24 * 3600
 

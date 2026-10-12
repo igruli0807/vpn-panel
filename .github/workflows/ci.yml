@@ -54,9 +54,17 @@ jobs:
       - name: vpnctl SSTP + VLESS with real clients
         run: sudo tests/test-vpnctl.sh
 
+  tg-proxy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # upstream images, pinned by digest inside vpnctl; the test talks to Telegram through each proxy
+      - name: vpnctl Telegram proxies (telemt, mtg) with a real MTProto handshake
+        run: sudo bash tests/test-tgproxy.sh
+
   publish:
     if: github.event_name == 'push'
-    needs: [secrets, panel, awg3, sstp-vless]
+    needs: [secrets, panel, awg3, sstp-vless, tg-proxy]
     runs-on: ubuntu-latest
     permissions:
       contents: read

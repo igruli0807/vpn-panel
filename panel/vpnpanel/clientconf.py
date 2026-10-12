@@ -43,6 +43,17 @@ def build(params, c, endpoint_host):
         cert = params.get("cert_pem") if params.get("self_signed") else None
         return {"kind": "sstp", "text": text, "qr": None, "filename": f"{safe}-sstp.txt", "mime": "text/plain",
                 "fields": fields, "cert_pem": cert, "cert_name": f"vpn-{endpoint_host}.crt"}
+    if kind in ("telemt", "mtg"):
+        # MTProto over fake TLS: "ee" + 16 secret bytes + the name of the site the proxy pretends to be
+        if kind == "mtg":
+            secret = params["secret"]                    # one shared secret, kept on the server
+        else:
+            secret = "ee" + (c.get("secret") or "") + params["domain"].encode().hex()
+        import urllib.parse as up
+        q = up.urlencode({"server": endpoint_host, "port": params["port"], "secret": secret})
+        link = f"https://t.me/proxy?{q}"
+        return {"kind": kind, "text": link, "qr": link, "tg_link": f"tg://proxy?{q}", "filename": f"{safe}-telegram.txt",
+                "mime": "text/plain", "fields": [], "cert_pem": None}
     if kind == "vless":
         import urllib.parse as up
         q = {"encryption": "none", "flow": params.get("flow") or "xtls-rprx-vision", "security": "reality",
@@ -65,6 +76,8 @@ APPS = {
     "wireguard": "WireGuard, Amnezia VPN или AmneziaWG",
     "sstp": "встроенный VPN Windows, Open SSTP Client (Android), MikroTik",
     "vless": "v2rayNG, Hiddify, Streisand, v2RayTun и другие клиенты Xray",
+    "telemt": "Telegram",
+    "mtg": "Telegram",
 }
 
 # Official download links (checked 28.09.2026 on amnezia.org, docs.amnezia.org, the stores).
@@ -131,17 +144,30 @@ _SSTP = {
         ("MikroTik — SSTP client", "https://help.mikrotik.com/docs/spaces/ROS/pages/2031645/SSTP", "mikrotik.com", ""),
     ],
 }
+# A Telegram proxy needs no extra app: the link opens in Telegram itself (official pages of the apps).
+_TELEGRAM = {
+    "android": [
+        ("Telegram", "https://play.google.com/store/apps/details?id=org.telegram.messenger", "Google Play", ""),
+        ("Telegram — APK", "https://telegram.org/android", "telegram.org", "если нет Google Play"),
+    ],
+    "ios": [("Telegram", "https://apps.apple.com/app/telegram-messenger/id686449807", "App Store", "")],
+    "desktop": [("Telegram Desktop — Windows, macOS, Linux", "https://desktop.telegram.org/", "telegram.org", "")],
+}
 PLATFORMS = (("android", "Android"), ("ios", "iPhone и iPad"), ("desktop", "Компьютер"))
 VERSION_NOTE = {
     "awg3": "Протокол AWG 3.1 — нужна свежая версия приложения: Amnezia VPN 5.0.1.5+ или AmneziaWG 3.1. "
             "Если после импорта нет подключения — обновите приложение.",
     "vless": "VLESS REALITY: импорт — сканом QR или ссылкой vless:// из буфера обмена.",
+    "telemt": "Это прокси только для Telegram, а не VPN: остальные приложения и сайты идут как обычно.",
+    "mtg": "Это прокси только для Telegram, а не VPN: остальные приложения и сайты идут как обычно. "
+           "Ссылка общая — одна на всех, кому её выдали.",
 }
 
 
 def app_links(kind):
     """-> {platform: [(name, url, where, note), ...]} for a container kind."""
-    return {"wireguard": _WIREGUARD, "vless": _VLESS, "sstp": _SSTP}.get(kind, _AMNEZIA)
+    return {"wireguard": _WIREGUARD, "vless": _VLESS, "sstp": _SSTP, "telemt": _TELEGRAM,
+            "mtg": _TELEGRAM}.get(kind, _AMNEZIA)
 
 
 def platform_of(user_agent):

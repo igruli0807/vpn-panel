@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""vpnctl — manage VPN servers on this host for the panel: AmneziaWG, SSTP (accel-ppp), VLESS (Xray REALITY).
+"""vpnctl — manage VPN servers on this host for the panel: AmneziaWG, SSTP (accel-ppp), VLESS (Xray REALITY),
+and Telegram proxies (MTProto over fake TLS): telemt and mtg.
 
 The panel calls it locally (sudo) or over SSH (forced command, see --ssh). Output: JSON on the last line.
 
   vpnctl list | dump [UNIT ...] | params UNIT | next-ip UNIT
-  vpnctl add UNIT --pub ID [--ip IP] [--name NAME]     # secret on stdin: AWG preshared key / SSTP password
+  vpnctl add UNIT --pub ID [--ip IP] [--name NAME]     # secret on stdin: AWG preshared key / SSTP password /
+                                                       # telemt user secret (32 hex)
   vpnctl remove|disable|enable UNIT --pub ID
   vpnctl set-name UNIT --pub ID --name NAME
-  vpnctl install awg3|sstp|vless [--port N] [--sni HOST] [--domain NAME]
-  vpnctl uninstall awg3|sstp|vless                     # container removed, data kept aside
+  vpnctl install awg3|sstp|vless|telemt|mtg [--port N] [--sni HOST] [--domain NAME]
+                                                       # telemt/mtg: --sni is the site the proxy pretends to be
+  vpnctl uninstall awg3|sstp|vless|telemt|mtg          # container removed, data kept aside
   vpnctl preflight | unlink | version
 
 Units and identities (ID):
   awg3, amnezia-awg2, amnezia-awg, amnezia-wireguard   AmneziaWG public key
   sstp (container), sstp-host (system accel-ppp)       login
   xray                                                 VLESS uuid
+  telemt                                               user name (each user has its own secret)
+  mtg-doppel                                           always "shared": mtg has one secret for everybody
 
-Secrets never leave the host: private/preshared keys and passwords are not printed.
+Secrets never leave the host: private/preshared keys, passwords and telemt user secrets are not printed.
+The one exception is `params mtg-doppel`: mtg has a single shared secret, and that secret IS the proxy link
+the panel has to hand out, so it is returned there (and only there).
 """
 import argparse
 import fcntl
@@ -28,14 +35,18 @@ import shlex
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 
-VERSION = "2.0.2"
+VERSION = "2.1.0"
 _env = lambda k, d: os.environ.get("VPNCTL_" + k) or os.environ.get("AWGCTL_" + k) or d
 BACKUP_DIR = _env("BACKUP_DIR", "/var/backups/vpnctl")
 BACKUP_KEEP = 20
 LOCK = _env("LOCK", "/run/vpnctl.lock")
 SSTP_DIR = _env("SSTP_DIR", "/opt/sstp")
 XRAY_DIR = _env("XRAY_DIR", "/opt/xray")
+TELEMT_DIR = _env("TELEMT_DIR", "/opt/telemt")
+MTG_DIR = _env("MTG_DIR", "/opt/mtg-doppel")
 HOST_SSTP_CONF = _env("HOST_SSTP_CONF", "/etc/accel-ppp.conf")
 STATE_DIR = _env("STATE_DIR", "/etc/vpnctl")
 LIB_DIR = _env("LIB", "/usr/local/lib/vpnctl")
@@ -44,9 +55,15 @@ NAME_RE = re.compile(r"^[^\x00-\x1f\"\\]{1,64}$")
 USER_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,31}$")
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 SSTP_PASS_RE = re.compile(r"^[A-Za-z0-9._~!@#%^+=:,-]{8,64}$")
-LOCAL_IMAGES = {"awg3": "awg3:3.1.20260828", "sstp": "sstp:1.14.0", "vless": "xray:26.3.27"}
+HEX32_RE = re.compile(r"^[0-9a-f]{32}$")
+DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$")
+LOCAL_IMAGES = {"awg3": "awg3:3.1.20260828", "sstp": "sstp:1.14.0", "vless": "xray:26.3.27",
+                "telemt": "ghcr.io/telemt/telemt:3.5.8", "mtg": "nineseconds/mtg:2.2.8"}
+# Telegram proxies run the upstream images as they are, pinned by digest (nothing of ours is added to them).
 REMOTE_IMAGES = {"awg3": "ghcr.io/igruli0807/awg3:3.1.20260828", "sstp": "ghcr.io/igruli0807/sstp:1.14.0",
-                 "vless": "ghcr.io/igruli0807/xray:26.3.27"}
+                 "vless": "ghcr.io/igruli0807/xray:26.3.27",
+                 "telemt": "ghcr.io/telemt/telemt@sha256:16edae66d4c092ec68e9b9449ce28a6dc5137c64edfe6ddf46991170b60c4823",
+                 "mtg": "nineseconds/mtg@sha256:c082586a19886e4822f92aa8c1949a771df3519053d64b1b5505a9a280a3929d"}
 
 KINDS = {
     # name: (kind, conf, iface, tool, clients_table)
@@ -875,6 +892,351 @@ def xr_set_name(name, uid, disp):
 
 
 # =====================================================================================
+# Telegram proxies (MTProto behind fake TLS). Both pretend to be a real web site: a Telegram client that knows
+# the secret gets the proxy, anybody else (a browser, a censor's probe) is passed through to the real site.
+# =====================================================================================
+
+def toml_get(text, section, key):
+    """Scalar from a flat TOML table ("" = top level); enough for the configs written here and upstream samples."""
+    return toml_table(text, section).get(key)
+
+
+def toml_table(text, section):
+    """{key: value} of one flat TOML table."""
+    out, cur = {}, ""
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            cur = s.strip("[]").strip()
+        elif cur == section and "=" in s and not s.startswith("#"):
+            k, _, v = s.partition("=")
+            v = v.split(" #", 1)[0].strip()
+            out[k.strip().strip('"')] = v[1:-1] if len(v) >= 2 and v[0] == v[-1] == '"' else v
+    return out
+
+
+def docker_host_port(unit, inner):
+    """Host port a container port is published on, or 0."""
+    p = sh(["docker", "port", unit, f"{inner}/tcp"], check=False)
+    for line in p.stdout.splitlines():
+        port = line.strip().rsplit(":", 1)[-1]
+        if port.isdigit():
+            return int(port)
+    return 0
+
+
+def check_domain(domain):
+    if not DOMAIN_RE.match(domain or ""):
+        raise Fail("bad domain (a host name like www.example.com is expected)")
+
+
+def fronting_check(port, domain, timeout=12):
+    """What a stranger sees on our port: a TLS client that asks for `domain` and knows no secret must get the
+    real site — its real certificate (verified against the system CA store) and an HTTP answer. -> (ok, detail)"""
+    import socket
+    import ssl
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as raw:
+            with ctx.wrap_socket(raw, server_hostname=domain) as tls:
+                tls.settimeout(timeout)
+                tls.sendall(f"HEAD / HTTP/1.1\r\nHost: {domain}\r\nUser-Agent: Mozilla/5.0\r\n"
+                            "Accept: */*\r\nConnection: close\r\n\r\n".encode())
+                head = tls.recv(64).decode("latin-1", "replace")
+        if not head.startswith("HTTP/"):
+            return False, f"no HTTP answer from {domain} through the proxy port"
+        return True, head.split("\r\n", 1)[0]
+    except (OSError, ValueError) as e:  # ssl.SSLError and socket.timeout are OSError
+        return False, str(e) or e.__class__.__name__
+
+
+def tg_selftest(unit, port, domain):
+    ok, detail = False, ""
+    for _ in range(4):
+        ok, detail = fronting_check(port, domain)
+        if ok:
+            break
+        time.sleep(3)
+    if not ok:
+        raise Fail(f"{unit} is running, but a stranger asking for {domain} on TCP {port} does not get the real "
+                   f"site ({detail}); the server must reach {domain}:443 — try another --sni")
+    say(f"self-test passed: a plain TLS client on TCP {port} is served by the real {domain} ({detail})")
+
+
+def tg_names(d):
+    return load_json_file(os.path.join(d, "names.json"), {})
+
+
+def tg_set_name(unit, d, pub, disp):
+    names = tg_names(d)
+    if disp is None:
+        names.pop(pub, None)
+    else:
+        names[pub] = disp
+    host_write(unit, os.path.join(d, "names.json"), json.dumps(names, ensure_ascii=False, indent=2))
+
+
+# ---------- telemt: many users, each with its own secret; managed live through its local HTTP API ----------
+
+TELEMT_UID = 65532          # "nonroot" in the image; the API rewrites config.toml itself, so it must own the directory
+TELEMT_KEEPER = "_vpnctl"   # telemt refuses to delete its last user; this placeholder (random secret nobody
+                            # knows) keeps the list non-empty. Hidden from list/dump, cannot be named by the panel.
+TELEMT_CONF_TEMPLATE = """[general]
+use_middle_proxy = true
+log_level = "normal"
+
+[general.modes]
+classic = false
+secure = false
+tls = true
+
+[general.links]
+show = "*"
+public_host = "{host}"
+public_port = {port}
+
+[server]
+port = 443
+
+[server.api]
+enabled = true
+listen = "0.0.0.0:9091"
+whitelist = [{whitelist}]
+
+[[server.listeners]]
+ip = "0.0.0.0"
+
+[censorship]
+tls_domain = "{domain}"
+mask = true
+tls_emulation = true
+tls_front_dir = "tlsfront"
+
+"""
+
+
+def tm_conf_path():
+    return f"{TELEMT_DIR}/config/config.toml"
+
+
+def tm_conf():
+    text = host_read(tm_conf_path())
+    if text is None:
+        raise Fail("telemt is not installed")
+    return text
+
+
+def tm_ports(text):
+    """-> (public port, port inside the container, API port inside the container)"""
+    inner = int(toml_get(text, "server", "port") or 443)
+    public = int(toml_get(text, "general.links", "public_port") or inner)
+    api = int((toml_get(text, "server.api", "listen") or "0.0.0.0:9091").rsplit(":", 1)[-1])
+    return public, inner, api
+
+
+def tm_api(method, path, body=None, timeout=10):
+    """Call the telemt control API (published on 127.0.0.1 only). -> data; Fail with telemt's own message."""
+    port = docker_host_port("telemt", tm_ports(tm_conf())[2])
+    if not port:
+        raise Fail("telemt is not running")
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}").get("data")
+    except urllib.error.HTTPError as e:
+        try:
+            err = json.loads(e.read() or b"{}").get("error") or {}
+        except (ValueError, OSError):
+            err = {}
+        raise Fail(f"telemt: {err.get('message') or err.get('code') or e.code}")
+    except (OSError, ValueError) as e:
+        raise Fail(f"telemt API does not answer: {e}")
+
+
+def tm_alive():
+    if "telemt" not in docker_names():
+        return False
+    try:
+        tm_api("GET", "/health", timeout=4)
+        return True
+    except Fail:
+        return False
+
+
+def tm_users():
+    """-> ([{pub, disabled, conns, ip, octets}], up). Live from the API; from config.toml when telemt is down."""
+    if tm_alive():
+        rows = [{"pub": u["username"], "disabled": not u.get("enabled", True),
+                 "conns": int(u.get("current_connections") or 0),
+                 "ip": (u.get("active_unique_ips_list") or [None])[0], "octets": int(u.get("total_octets") or 0)}
+                for u in tm_api("GET", "/users") or []]
+        up = True
+    else:
+        text = tm_conf()
+        off = {k for k, v in toml_table(text, "access.user_enabled").items() if v == "false"}
+        rows = [{"pub": k, "disabled": k in off, "conns": 0, "ip": None, "octets": 0}
+                for k in toml_table(text, "access.users")]
+        up = False
+    return [r for r in rows if r["pub"] != TELEMT_KEEPER], up
+
+
+def tm_info(name="telemt"):
+    rows, up = tm_users()
+    return {"name": "telemt", "kind": "telemt", "iface": "tcp", "port": tm_ports(tm_conf())[0], "up": up,
+            "peers": sum(1 for r in rows if not r["disabled"]), "disabled": sum(1 for r in rows if r["disabled"])}
+
+
+def tm_dump(name="telemt"):
+    rows, up = tm_users()
+    names, now = tg_names(TELEMT_DIR), int(time.time())
+    # telemt counts one total per user (both directions together): reported as rx
+    peers = [{"pub": r["pub"], "name": names.get(r["pub"], ""), "ip": "", "disabled": r["disabled"],
+              "endpoint": r["ip"], "latest_handshake": now if r["conns"] else 0, "rx": r["octets"], "tx": 0}
+             for r in rows]
+    return {"kind": "telemt", "up": up, "port": tm_ports(tm_conf())[0], "peers": peers, "at": now}
+
+
+def tm_params(name="telemt"):
+    text = tm_conf()
+    return {"kind": "telemt", "port": tm_ports(text)[0], "domain": toml_get(text, "censorship", "tls_domain") or ""}
+
+
+def tm_need_user(user):
+    check_user(user)
+    if user not in [r["pub"] for r in tm_users()[0]]:
+        raise Fail("no such user")
+
+
+def tm_add(name, user, disp, secret):
+    check_user(user)
+    if not HEX32_RE.match(secret or ""):
+        raise Fail("bad secret (32 hex characters are expected on stdin)")
+    if not tm_alive():
+        raise Fail("telemt is not running")
+    if user in [r["pub"] for r in tm_users()[0]]:
+        raise Fail("user already exists")
+    tm_api("POST", "/users", {"username": user, "secret": secret})
+    tg_set_name("telemt", TELEMT_DIR, user, disp or "")
+    return {"ok": True, "ip": ""}
+
+
+def tm_keeper():
+    import secrets as _s
+    if TELEMT_KEEPER not in toml_table(tm_conf(), "access.users"):
+        tm_api("POST", "/users", {"username": TELEMT_KEEPER, "secret": _s.token_hex(16)})
+
+
+def tm_remove(name, user):
+    tm_need_user(user)
+    tm_keeper()
+    tm_api("DELETE", f"/users/{user}")
+    tg_set_name("telemt", TELEMT_DIR, user, None)
+    return {"ok": True}
+
+
+def tm_toggle(name, user, disable):
+    tm_need_user(user)
+    tm_api("POST", f"/users/{user}/" + ("disable" if disable else "enable"))   # disable also drops live sessions
+    return {"ok": True}
+
+
+def tm_set_name(name, user, disp):
+    check_user(user)
+    tg_set_name("telemt", TELEMT_DIR, user, disp)
+    return {"ok": True}
+
+
+# ---------- mtg: one secret for everybody (the proxy link itself), no user management ----------
+
+MTG_SHARED = "shared"
+MTG_CONF_TEMPLATE = """secret = "{secret}"
+bind-to = "0.0.0.0:3128"
+prefer-ip = "only-ipv4"
+tolerate-time-skewness = "12h"
+
+[domain-fronting]
+port = 443
+
+[network]
+dns = "https://1.1.1.1"
+
+[network.timeout]
+handshake = "10s"
+
+[network.keep-alive]
+idle = "15s"
+interval = "15s"
+
+[defense.doppelganger]
+urls = [{urls}]
+repeats-per-raid = 10
+raid-each = "6h"
+drs = true
+"""
+# Pages mtg samples to copy the timing of the real site ("Doppelganger"): known-good ones for the default domain.
+MTG_URLS = {"www.intel.com": ["https://www.intel.com/content/www/us/en/homepage.html",
+                              "https://www.intel.com/content/www/us/en/products/overview.html"]}
+
+
+def mtg_conf():
+    text = host_read(f"{MTG_DIR}/config.toml")
+    if text is None:
+        raise Fail("mtg is not installed")
+    return text
+
+
+def mtg_secret(text):
+    """-> (secret as hex "ee…", fronting domain). mtg also accepts the base64 form of the same bytes."""
+    raw = toml_get(text, "", "secret") or ""
+    if not re.match(r"^ee[0-9a-f]{34,}$", raw):
+        import base64
+        try:
+            raw = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).hex()
+        except ValueError:
+            raw = ""
+    if not re.match(r"^ee[0-9a-f]{34,}$", raw):
+        raise Fail("mtg: config.toml has no FakeTLS secret")
+    return raw, bytes.fromhex(raw[34:]).decode("ascii", "replace")
+
+
+def mtg_port():
+    return docker_host_port("mtg-doppel", 3128) or int(load_json_file(f"{MTG_DIR}/meta.json", {}).get("port") or 0)
+
+
+def mtg_info(name="mtg-doppel"):
+    mtg_secret(mtg_conf())
+    return {"name": "mtg-doppel", "kind": "mtg", "iface": "tcp", "port": mtg_port(),
+            "up": "mtg-doppel" in docker_names(), "peers": 1, "disabled": 0}
+
+
+def mtg_dump(name="mtg-doppel"):
+    mtg_secret(mtg_conf())
+    disp = tg_names(MTG_DIR).get(MTG_SHARED) or "Telegram — общая ссылка"
+    return {"kind": "mtg", "up": "mtg-doppel" in docker_names(), "port": mtg_port(), "at": int(time.time()),
+            "peers": [{"pub": MTG_SHARED, "name": disp, "ip": "", "disabled": False, "endpoint": None,
+                       "latest_handshake": 0, "rx": 0, "tx": 0}]}   # mtg keeps no per-user counters
+
+
+def mtg_params(name="mtg-doppel"):
+    secret, domain = mtg_secret(mtg_conf())
+    return {"kind": "mtg", "port": mtg_port(), "domain": domain, "secret": secret}
+
+
+def mtg_refuse(*_a):
+    raise Fail("mtg has one shared link for everybody: it cannot be added, disabled or removed per client — "
+               "to revoke it uninstall mtg and install it again (a new secret is generated)")
+
+
+def mtg_set_name(name, pub, disp):
+    if pub != MTG_SHARED:
+        raise Fail("no such user")
+    tg_set_name("mtg-doppel", MTG_DIR, MTG_SHARED, disp)
+    return {"ok": True}
+
+
+# =====================================================================================
 # dispatch
 # =====================================================================================
 
@@ -885,12 +1247,20 @@ def unit_kind(name):
         return "sstp"
     if name == "xray":
         return "vless"
+    if name == "telemt":
+        return "telemt"
+    if name == "mtg-doppel":
+        return "mtg"
     raise Fail(f"unsupported unit: {name}")
 
 
 def running_units():
     names = docker_names()
     units = [n for n in names if n in KINDS or n in ("sstp", "xray")]
+    # Telegram proxies are listed only when their config is where vpnctl keeps it (containers of the same name
+    # started by hand elsewhere are not ours)
+    units += [n for n, conf in (("telemt", tm_conf_path()), ("mtg-doppel", f"{MTG_DIR}/config.toml"))
+              if n in names and os.path.exists(conf)]
     if host_sstp_active():
         units.append("sstp-host")
     return units
@@ -908,7 +1278,14 @@ DRIVERS = {
               "add": lambda u, a, s: xr_add(u, a.pub, a.name), "remove": xr_remove,
               "disable": lambda u, p: xr_toggle(u, p, True), "enable": lambda u, p: xr_toggle(u, p, False),
               "set-name": xr_set_name},
+    "telemt": {"info": tm_info, "dump": tm_dump, "params": tm_params,
+               "add": lambda u, a, s: tm_add(u, a.pub, a.name, s), "remove": tm_remove,
+               "disable": lambda u, p: tm_toggle(u, p, True), "enable": lambda u, p: tm_toggle(u, p, False),
+               "set-name": tm_set_name},
+    "mtg": {"info": mtg_info, "dump": mtg_dump, "params": mtg_params, "add": mtg_refuse, "remove": mtg_refuse,
+            "disable": mtg_refuse, "enable": mtg_refuse, "set-name": mtg_set_name},
 }
+OTHER_UNITS = ("sstp", "sstp-host", "xray", "telemt", "mtg-doppel")
 
 
 def drv(name):
@@ -930,7 +1307,7 @@ def cmd_dump(a):
         try:
             res[u] = drv(u)["dump"](u)
         except Fail as e:
-            res[u] = {"kind": unit_kind(u) if u in KINDS or u in ("sstp", "sstp-host", "xray") else "?",
+            res[u] = {"kind": unit_kind(u) if u in KINDS or u in OTHER_UNITS else "?",
                       "up": False, "port": 0, "peers": [], "at": int(time.time()), "error": str(e)}
     return res
 
@@ -1264,9 +1641,152 @@ def install_vless(a):
     raise Fail("no REALITY target worked from this server; try install vless --sni <host>")
 
 
-INSTALLERS = {"awg3": install_awg3, "sstp": install_sstp, "vless": install_vless}
-UNIT_OF = {"awg3": "awg3", "sstp": "sstp", "vless": "xray"}
-DATA_DIR = {"sstp": SSTP_DIR, "vless": XRAY_DIR}
+def bridge_subnets():
+    """Subnets of docker's default bridge: the telemt API sees requests from the host as coming from there."""
+    p = sh(["docker", "network", "inspect", "bridge", "--format", "{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
+           check=False)
+    return [x for x in p.stdout.split() if ":" not in x]
+
+
+def tg_port(wanted, current, default, what):
+    """Telegram proxies get a well-known default port (clients behind strict firewalls reach 443 best).
+    `current` is the port our own running container already holds (not "busy")."""
+    port = int(wanted or current or default)
+    if port != current and port in busy_ports("tcp"):
+        raise Fail(f"TCP port {port} is busy on this server" + ("" if wanted else f" (the default for {what})") +
+                   " — choose another one with --port")
+    return port
+
+
+def tg_reachable(domain):
+    """The site to pretend to be must be reachable from here over HTTPS, or the disguise shows nothing."""
+    say(f"checking that {domain} answers over HTTPS from this server")
+    try:
+        req = urllib.request.Request(f"https://{domain}/", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.geturl()
+    except urllib.error.HTTPError as e:   # 403/404 on the front page is still a live HTTPS site
+        return e.geturl() or f"https://{domain}/"
+    except (OSError, ValueError) as e:
+        raise Fail(f"{domain} does not answer over HTTPS from this server ({e}) — choose another --sni")
+
+
+def tm_write_conf(text):
+    d = os.path.dirname(tm_conf_path())
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    host_write("telemt", tm_conf_path(), text, 0o600)
+    for p in (d, tm_conf_path()):   # the API of telemt rewrites config.toml itself (temp file + rename)
+        os.chown(p, TELEMT_UID, TELEMT_UID)
+    os.chmod(d, 0o700)
+
+
+def tm_run(image, text):
+    public, inner, api = tm_ports(text)
+    sh(["docker", "rm", "-f", "telemt"], check=False)
+    api_host = api if api not in busy_ports("tcp") else pick_port("tcp")   # host side of the API: 127.0.0.1 only
+    # the image is distroless (no shell), so its exec-form health check cannot be re-pointed at our config path
+    sh(["docker", "run", "-d", "--name", "telemt", "--restart", "unless-stopped",
+        "-p", f"{public}:{inner}/tcp", "-p", f"127.0.0.1:{api_host}:{api}/tcp",
+        "-w", "/run/telemt", "-v", f"{TELEMT_DIR}/config:/etc/telemt:rw", "--tmpfs", "/run/telemt:rw,mode=1777,size=4m",
+        "-e", "RUST_LOG=info", "--cap-drop", "ALL", "--cap-add", "NET_BIND_SERVICE", "--read-only",
+        "--security-opt", "no-new-privileges:true", "--ulimit", "nofile=65536:262144", "--no-healthcheck",
+        "--log-driver", "json-file", "--log-opt", "max-size=20m", "--log-opt", "max-file=3",
+        image, "/etc/telemt/config.toml"])
+    if not wait_for(tm_alive, 45):
+        logs = sh(["docker", "logs", "--tail", "5", "telemt"], check=False)
+        raise Fail("telemt container started but its API does not answer; see: docker logs telemt — "
+                   + (logs.stdout + logs.stderr).strip()[-300:])
+    return public
+
+
+def install_telemt(a):
+    image = ensure_image("telemt")
+    old = host_read(tm_conf_path())
+    if old is not None and not a.port and not a.sni:
+        domain = toml_get(old, "censorship", "tls_domain")
+        say(f"keeping existing config and users (TCP {tm_ports(old)[0]}, site {domain})")
+        port = tm_run(image, old)
+        tg_selftest("telemt", port, domain)
+        return {"ok": True, "unit": "telemt", "port": port, "sni": domain}
+    domain = (a.sni or (toml_get(old, "censorship", "tls_domain") if old else "") or "www.samsung.com").lower()
+    check_domain(domain)
+    port = tg_port(a.port, tm_ports(old)[0] if old else 0, 443, "telemt")   # all checks before anything is touched
+    tg_reachable(domain)
+    wl = ["127.0.0.1/32", "172.16.0.0/12"] + [x for x in bridge_subnets()
+                                             if not ipaddress.ip_network(x).subnet_of(ipaddress.ip_network("172.16.0.0/12"))]
+    text = TELEMT_CONF_TEMPLATE.format(host=a.domain or public_ip(), port=port, domain=domain,
+                                       whitelist=", ".join(f'"{x}"' for x in wl))
+    import secrets as _s
+    users = toml_table(old, "access.users") if old else {}
+    users.setdefault(TELEMT_KEEPER, _s.token_hex(16))
+    text += "[access.users]\n" + "".join(f'{k} = "{v}"\n' for k, v in users.items())
+    off = [k for k, v in (toml_table(old, "access.user_enabled") if old else {}).items() if v == "false"]
+    if off:
+        text += "\n[access.user_enabled]\n" + "".join(f"{k} = false\n" for k in off)
+    if old and a.sni and a.sni.lower() != (toml_get(old, "censorship", "tls_domain") or ""):
+        say("the site changed: links issued before stop working, clients need new ones")
+    os.makedirs(TELEMT_DIR, mode=0o755, exist_ok=True)
+    tm_write_conf(text)
+    tm_run(image, text)
+    tg_selftest("telemt", port, domain)
+    say(f"telemt is running on TCP {port}, pretending to be {domain}")
+    return {"ok": True, "unit": "telemt", "port": port, "sni": domain}
+
+
+def mtg_run(image, port):
+    sh(["docker", "rm", "-f", "mtg-doppel"], check=False)
+    sh(["docker", "run", "-d", "--name", "mtg-doppel", "--restart", "unless-stopped", "-p", f"{port}:3128/tcp",
+        "-v", f"{MTG_DIR}/config.toml:/config.toml:ro", "--log-driver", "json-file", "--log-opt", "max-size=20m",
+        "--log-opt", "max-file=3", image, "run", "/config.toml"])
+    time.sleep(3)   # a bad config makes mtg exit at once
+    if "mtg-doppel" not in docker_names():
+        logs = sh(["docker", "logs", "--tail", "5", "mtg-doppel"], check=False)
+        raise Fail("mtg did not start; see: docker logs mtg-doppel — " + (logs.stdout + logs.stderr).strip()[-300:])
+
+
+def install_mtg(a):
+    image = ensure_image("mtg")
+    old = host_read(f"{MTG_DIR}/config.toml")
+    old_port = mtg_port() if old is not None else 0
+    if old is not None and not a.port and not a.sni and old_port:
+        _, domain = mtg_secret(old)
+        say(f"keeping existing config and link (TCP {old_port}, site {domain})")
+        mtg_run(image, old_port)
+        tg_selftest("mtg", old_port, domain)
+        return {"ok": True, "unit": "mtg-doppel", "port": old_port, "sni": domain}
+    old_secret, old_domain = mtg_secret(old) if old is not None else ("", "")
+    domain = (a.sni or old_domain or "www.intel.com").lower()
+    check_domain(domain)
+    port = tg_port(a.port, old_port, 9443, "mtg")
+    front = tg_reachable(domain)
+    # Doppelganger needs real HTTPS pages of the site it imitates (mtg fetches them to learn the timing)
+    urls = MTG_URLS.get(domain)
+    if not urls:
+        same_host = front.split("/")[2].lower() == domain if front.count("/") >= 2 else False
+        urls = [front if same_host else f"https://{domain}/"]
+        say(f"Doppelganger will sample {urls[0]} (the front page; for a closer imitation put more pages of "
+            f"{domain} into {MTG_DIR}/config.toml)")
+    if domain == old_domain:
+        secret = old_secret   # same site: the link stays valid
+    else:
+        import secrets as _s
+        secret = "ee" + _s.token_hex(16) + domain.encode().hex()
+        if old_secret:
+            say("the site changed: the old link stops working, hand out the new one")
+    os.makedirs(MTG_DIR, mode=0o755, exist_ok=True)
+    host_write("mtg-doppel", f"{MTG_DIR}/config.toml",
+               MTG_CONF_TEMPLATE.format(secret=secret, urls=", ".join(f'"{u}"' for u in urls)), 0o600)
+    host_write("mtg-doppel", f"{MTG_DIR}/meta.json", json.dumps({"port": port, "domain": domain}, indent=2), 0o600)
+    mtg_run(image, port)
+    tg_selftest("mtg", port, domain)
+    say(f"mtg is running on TCP {port}, pretending to be {domain}")
+    return {"ok": True, "unit": "mtg-doppel", "port": port, "sni": domain}
+
+
+INSTALLERS = {"awg3": install_awg3, "sstp": install_sstp, "vless": install_vless,
+              "telemt": install_telemt, "mtg": install_mtg}
+UNIT_OF = {"awg3": "awg3", "sstp": "sstp", "vless": "xray", "telemt": "telemt", "mtg": "mtg-doppel"}
+DATA_DIR = {"sstp": SSTP_DIR, "vless": XRAY_DIR, "telemt": TELEMT_DIR, "mtg": MTG_DIR}
 
 
 def cmd_install(a):
@@ -1358,7 +1878,7 @@ def build_parser():
     ins = sub.add_parser("install")
     ins.add_argument("proto", choices=sorted(INSTALLERS))
     ins.add_argument("--port", type=int)
-    ins.add_argument("--sni", default="")
+    ins.add_argument("--sni", default="", help="vless: REALITY target; telemt/mtg: the site the proxy pretends to be")
     ins.add_argument("--domain", default="")
     ins.add_argument("--cert", default="", help="sstp: certificate chain file to use instead of a self-signed one")
     ins.add_argument("--key", default="", help="sstp: private key for --cert")

@@ -8,9 +8,14 @@ import time
 from . import clientconf, keys, runner
 
 # Where each container kind can be managed from the panel.
-CAN_ADD = {"awg3", "awg2", "sstp", "vless"}
+CAN_ADD = {"awg3", "awg2", "sstp", "vless", "telemt"}
 KIND_TITLE = {"awg3": "AWG 3.1", "awg2": "AWG 2.0", "legacy": "AWG Legacy", "wireguard": "WireGuard",
-              "sstp": "SSTP", "vless": "VLESS"}
+              "sstp": "SSTP", "vless": "VLESS", "telemt": "Telegram · telemt", "mtg": "Telegram · mtg"}
+# Telegram proxies (MTProto behind fake TLS): the client gets a t.me/proxy link, not a VPN config.
+TG_KINDS = {"telemt", "mtg"}
+# Units with one link shared by everybody (mtg): the server reports a single peer, nothing to add or switch off.
+SHARED_UNITS = {"mtg-doppel"}
+TCP_KINDS = {"sstp", "vless", "telemt", "mtg"}
 AWG_KINDS = {"awg3", "awg2", "legacy", "wireguard"}
 _LOGIN_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
 _PASS_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789"
@@ -56,6 +61,10 @@ def create_client(cfg, db, sid, container, name, ip=None, login=None):
         pub = (login or "").strip().lower() or "u" + _rand(_LOGIN_ALPHABET, 7)
         secret = _rand(_PASS_ALPHABET, 16)
         stdin, ip, args = secret + "\n", "", ["--pub", pub]
+    elif kind == "telemt":
+        pub = (login or "").strip().lower() or "u" + _rand(_LOGIN_ALPHABET, 7)
+        secret = secrets.token_hex(16)
+        stdin, ip, args = secret + "\n", "", ["--pub", pub]
     else:  # vless
         import uuid
         pub, stdin, ip, args = str(uuid.uuid4()), "", "", None
@@ -73,6 +82,8 @@ def create_client(cfg, db, sid, container, name, ip=None, login=None):
 
 def has_config(c):
     """Panel can hand out a config only for clients it created (it holds their key / password)."""
+    if c.get("container") in SHARED_UNITS:   # the shared link lives on the server, any admin of it may hand it out
+        return True
     return bool(c.get("priv") or c.get("secret") or (c.get("source") == "panel" and c.get("kind") == "vless")
                 or (c.get("source") == "panel" and _is_uuid(c.get("pub"))))
 
@@ -97,6 +108,9 @@ def _op(cfg, db, cid, action):
     c = get_client(db, cid)
     if is_protected(cfg, c):
         raise OpError("это служебный пир, его нельзя трогать из панели")
+    if c["container"] in SHARED_UNITS:
+        raise OpError("у этого прокси одна ссылка на всех — её нельзя отключить или удалить отдельно. "
+                      "Чтобы отозвать ссылку, удалите протокол на странице «Серверы» и установите заново")
     try:
         runner.run(cfg, _server(cfg, c["server"]), action, c["container"], "--pub", c["pub"])
     except runner.CtlError as e:
@@ -161,6 +175,9 @@ def migrate(cfg, db, cid, target_sid, target_container):
 
 def client_config(cfg, db, c):
     if not has_config(c):
+        if c["container"] == "telemt":
+            raise OpError("этот пользователь прокси создан не в панели — его секрета здесь нет. "
+                          "Создайте нового клиента на этом прокси и выдайте ссылку ему")
         raise OpError("у этого клиента нет ключа в панели (он создан в приложении Amnezia) — "
                       "выдайте ему новый конфиг через «Перевести на AWG 3.1»")
     s = _server(cfg, c["server"])

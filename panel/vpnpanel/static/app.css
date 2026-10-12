@@ -2,7 +2,7 @@
 .app{
   --bg:#f3f4f1;--surface:#ffffff;--surface2:#eceee9;--text:#15181b;--muted:#545c64;--line:#d6dad2;
   --accent:#1f4fd1;--accent-ink:#ffffff;--ok:#146c43;--ok-bg:#e2f1e7;--danger:#b42318;--danger-bg:#fcebe9;--danger-line:#eeb4ad;
-  --p-awg3:#0f6e66;--p-awg2:#1f4fd1;--p-legacy:#5c646c;--p-wg:#6b2bd6;--p-sstp:#a44f05;--p-vless:#b3175b;--p-fill-ink:#ffffff;
+  --p-awg3:#0f6e66;--p-awg2:#1f4fd1;--p-legacy:#5c646c;--p-wg:#6b2bd6;--p-sstp:#a44f05;--p-vless:#b3175b;--p-tg:#0f6aa8;--p-fill-ink:#ffffff;
   --r-s:6px;--r-m:10px;--r-l:14px;
   --f-xs:11px;--f-s:12px;--f-m:14px;--f-l:16px;--f-xl:22px;--f-xxl:28px;
   font:14px/1.45 system-ui,-apple-system,"Segoe UI","Ubuntu","Cantarell",sans-serif;
@@ -12,7 +12,7 @@
   .app{
     --bg:#101316;--surface:#181c20;--surface2:#21262b;--text:#e6e9eb;--muted:#9aa3ab;--line:#2c3237;
     --accent:#7fa6ff;--accent-ink:#0b1430;--ok:#55c486;--ok-bg:#12291c;--danger:#ff8a80;--danger-bg:#321614;--danger-line:#6b2a25;
-    --p-awg3:#3fcfbf;--p-awg2:#7fa6ff;--p-legacy:#a3abb3;--p-wg:#b596ff;--p-sstp:#f0a35a;--p-vless:#ff82b4;--p-fill-ink:#07201d
+    --p-awg3:#3fcfbf;--p-awg2:#7fa6ff;--p-legacy:#a3abb3;--p-wg:#b596ff;--p-sstp:#f0a35a;--p-vless:#ff82b4;--p-tg:#6cc4ff;--p-fill-ink:#07201d
   }
 }
 .app *{box-sizing:border-box}
@@ -66,6 +66,7 @@ a{color:var(--accent)}
 .b-wg{color:var(--p-wg);border-radius:10px}
 .b-sstp{color:var(--p-sstp);border-radius:0;border-width:1.5px 1.5px 3px}
 .b-vless{background:var(--p-vless);border-color:var(--p-vless);color:var(--p-fill-ink);border-radius:10px}
+.b-tg{color:var(--p-tg);border-radius:10px 10px 10px 2px}
 /* статус */
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
 .dot.on{background:var(--ok);box-shadow:0 0 0 3px var(--ok-bg)}
